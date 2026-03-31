@@ -39,3 +39,10 @@ diversification score
 
 what is live equity chart
 
+
+see todo.md, do lines 1 to 11.  do you have comments or questions
+
+
+
+
+
