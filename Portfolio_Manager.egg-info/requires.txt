@@ -6,7 +6,26 @@ pyarrow
 requests
 python-dotenv
 
+[all]
+pytest
+mypy
+ruff
+black
+flet
+duckdb
+quantstats
+pyportfolioopt
+matplotlib
+
 [dev]
 pytest
 mypy
 ruff
+black
+
+[ui]
+flet
+duckdb
+quantstats
+pyportfolioopt
+matplotlib

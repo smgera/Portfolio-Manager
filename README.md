@@ -80,7 +80,10 @@ cd Portfolio-Manager
 conda create -n portman python=3.11
 conda activate portman
 
-# Install as editable package
+# Option A: Use the installation script (handles editable mode automatically)
+python install.py
+
+# Option B: Manual editable installation
 pip install -e .
 
 # Run the application

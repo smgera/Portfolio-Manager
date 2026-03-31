@@ -7,6 +7,15 @@ in your Python environment.
 
 from setuptools import setup, find_packages
 import os
+import sys
+
+# Check if installing in editable mode
+if 'develop' in sys.argv or 'editable' in sys.argv:
+    print("✓ Installing in editable mode - changes will be immediate")
+else:
+    print("⚠ Warning: Not installing in editable mode")
+    print("  For development, use: pip install -e .")
+    print("  This allows changes to be immediately available")
 
 # Read requirements from pyproject.toml or use hardcoded dependencies
 dependencies = [

@@ -1,13 +1,9 @@
-DailyData.py
 Portmanv2.py
 README.md
-accountActivity.py
-metadata_io.py
-portfolio_performance.py
 pyproject.toml
-read_portfolio_positions.py
-refresh_metadata_registry.py
+setup.py
 Acquire/DailyData.py
+Acquire/README.md
 Acquire/__init__.py
 Acquire/acquire_config.py
 Acquire/adjust.py
@@ -30,7 +26,9 @@ Acquire/bak/scrape.py
 Acquire/bak/scrapeStockanalysis.py
 Acquire/bak/scrape_etf_marketcap.py
 Acquire/bak/scrape_stock_marketcap.py
+Monitor/README.md
 Monitor/XaccountActivity.py
+Monitor/Xportfolio_performance.py
 Monitor/__init__.py
 Monitor/accountActivity.py
 Monitor/compare_reports.py
@@ -42,6 +40,7 @@ Monitor/read_portfolio_positions.py
 Portfolio_Manager.egg-info/PKG-INFO
 Portfolio_Manager.egg-info/SOURCES.txt
 Portfolio_Manager.egg-info/dependency_links.txt
+Portfolio_Manager.egg-info/entry_points.txt
 Portfolio_Manager.egg-info/requires.txt
 Portfolio_Manager.egg-info/top_level.txt
 common/__init__.py
@@ -51,10 +50,12 @@ common/financial_metrics.py
 common/financial_utils.py
 common/logging_setup.py
 common/metadata_io.py
+common/migration_guide.md
 common/portfolio_utils.py
 common/providers.py
 common/refactoring_examples.py
 common/symbols_from_description.py
+config/__init__.py
 utils/__init__.py
 utils/batch.py
 utils/check_dependencies.py
