@@ -61,15 +61,39 @@ Portfolio-Manager/
 
 ### Prerequisites
 
-- Python 3.10+
+- Python 3.11+
 - Conda (recommended) or pip
 - Internet connection for live data
 
 ### Installation
 
-#### Conda (Recommended)
+#### Option 1: Install as Editable Package (Recommended)
+
+This allows importing modules from anywhere and ensures changes are immediately available.
 
 ```bash
+# Clone the repository
+git clone https://github.com/smgera/Portfolio-Manager.git
+cd Portfolio-Manager
+
+# Create conda environment
+conda create -n portman python=3.11
+conda activate portman
+
+# Install as editable package
+pip install -e .
+
+# Run the application
+python Portmanv2.py
+```
+
+#### Option 2: Manual Dependencies
+
+```bash
+# Clone the repository
+git clone https://github.com/smgera/Portfolio-Manager.git
+cd Portfolio-Manager
+
 # Create environment from spec
 conda env create -f environment.yml
 conda activate portman
@@ -78,14 +102,29 @@ conda activate portman
 python Portmanv2.py
 ```
 
-#### pip
+#### Option 3: pip Only
 
 ```bash
+# Clone the repository
+git clone https://github.com/smgera/Portfolio-Manager.git
+cd Portfolio-Manager
+
 # Install dependencies
 pip install flet pandas numpy yfinance duckdb quantstats pyportfolioopt matplotlib openpyxl
 
 # Run the application
 python Portmanv2.py
+```
+
+#### Installing with Optional Dependencies
+
+```bash
+# Install with all optional dependencies (UI + dev tools)
+pip install -e ".[all]"
+
+# Or install specific extras:
+pip install -e ".[ui]"    # UI dependencies only
+pip install -e ".[dev]"   # Development tools only
 ```
 
 The application will open in your default browser at `http://localhost:8550`
