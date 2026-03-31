@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "Portfolio-Manager"
+version = "2.0.0"
+description = "Portfolio management and performance tracking tool"
+requires-python = ">=3.11"
+dependencies = [
+    "pandas",
+    "numpy",
+    "yfinance",
+    "exchange-calendars",
+    "pyarrow",
+    "requests",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "mypy",
+    "ruff",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["Acquire*", "utils*", "common*", "Monitor*"]
+
+[tool.setuptools]
+py-modules = ["config", "Portmanv2", "portfolio_performance", "accountActivity", "metadata_io", "read_portfolio_positions", "refresh_metadata_registry", "DailyData"]

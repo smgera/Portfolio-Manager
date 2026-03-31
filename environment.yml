@@ -8,6 +8,7 @@ dependencies:
   - pandas
   - numpy
   - matplotlib
+  - exchange-calendars
   - pip:
     - flet
     - yfinance

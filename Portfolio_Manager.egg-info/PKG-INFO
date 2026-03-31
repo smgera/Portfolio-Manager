@@ -1,0 +1,16 @@
+Metadata-Version: 2.4
+Name: Portfolio-Manager
+Version: 2.0.0
+Summary: Portfolio management and performance tracking tool
+Requires-Python: >=3.11
+Requires-Dist: pandas
+Requires-Dist: numpy
+Requires-Dist: yfinance
+Requires-Dist: exchange-calendars
+Requires-Dist: pyarrow
+Requires-Dist: requests
+Requires-Dist: python-dotenv
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: mypy; extra == "dev"
+Requires-Dist: ruff; extra == "dev"
