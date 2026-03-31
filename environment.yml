@@ -1,0 +1,22 @@
+name: portman
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pandas
+  - numpy
+  - matplotlib
+  - pip:
+    - flet
+    - yfinance
+    - duckdb
+    - quantstats
+    - pyportfolioopt
+    - openpyxl
+    - xlrd
+    - html5lib
+    - lxml
+    - pyarrow
+    - fastparquet
