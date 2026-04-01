@@ -11,7 +11,8 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import duckdb
-import os, io, base64, time, json, math
+import os, io, base64, time, json, math, sys
+from pathlib import Path
 from datetime import datetime, timedelta
 import quantstats as qs
 import threading
@@ -19,6 +20,16 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
+
+# Add project root to path for config and module imports
+_project_root = Path(__file__).parent
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
+
+from config import ACCOUNT_ACTIVITY_DIR, TICKER_LISTS_DIR, PARENT_DATA_DIR
+from Acquire.DailyData import daily_data as fetch_daily_data
+from Monitor.read_portfolio_positions import read_portfolio_positions
+from Monitor.accountActivity import all_activity_data
 
 class UltraDataEngine:
     def __init__(self):
@@ -35,6 +46,22 @@ class UltraDataEngine:
         self.risk_profile = "Aggressive"
         self.raw_files = {}
         self.import_summary = []
+        self._open_position_symbols = set()  # from myTickers.tsv
+        self._load_open_positions()
+
+    def _load_open_positions(self):
+        """Load current open position symbols from myTickers.tsv"""
+        try:
+            my_tickers_path = TICKER_LISTS_DIR / "myTickers.tsv"
+            if my_tickers_path.exists():
+                df = pd.read_csv(my_tickers_path, sep='\t')
+                if 'Symbol' in df.columns:
+                    self._open_position_symbols = set(df['Symbol'].dropna().astype(str).tolist())
+                elif len(df.columns) > 0:
+                    # Try first column as symbol
+                    self._open_position_symbols = set(df.iloc[:, 0].dropna().astype(str).tolist())
+        except Exception:
+            self._open_position_symbols = set()
 
     def _init_db(self):
         self.conn.execute('''
@@ -251,19 +278,26 @@ class UltraDataEngine:
             if c in holdings_df.columns:
                 agg[c] = 'last'
         self.holdings = holdings_df.groupby('symbol').agg(agg).reset_index()
+        # Filter to only open positions from myTickers.tsv (exclude closed positions)
+        if self._open_position_symbols:
+            self.holdings = self.holdings[self.holdings['symbol'].isin(self._open_position_symbols)]
         # Filter valid stock symbols
         symbols = [s for s in self.holdings['symbol'].unique().tolist() if s and s not in junk_syms and len(s) <= 10]
         if symbols:
             try:
-                dl = yf.download(symbols, period="5y", progress=False, auto_adjust=True)
-                lvl0 = dl.columns.get_level_values(0) if isinstance(dl.columns, pd.MultiIndex) else dl.columns
-                price_col = 'Close' if 'Close' in lvl0 else ('Adj Close' if 'Adj Close' in lvl0 else None)
-                if price_col and isinstance(dl.columns, pd.MultiIndex):
-                    self.prices = dl[price_col] if len(symbols) > 1 else dl[[price_col]].droplevel(0, axis=1)
-                elif price_col:
-                    self.prices = dl[[price_col]].rename(columns={price_col: symbols[0]}) if len(symbols) == 1 else dl
+                # Use DailyData.py for price data instead of direct yfinance calls
+                price_frames = {}
+                for sym in symbols:
+                    try:
+                        sym_data = fetch_daily_data(sym, period='5y')
+                        if sym_data is not None and not sym_data.empty and 'Close' in sym_data.columns:
+                            price_frames[sym] = sym_data['Close']
+                    except Exception:
+                        pass
+                if price_frames:
+                    self.prices = pd.DataFrame(price_frames)
                 else:
-                    self.prices = dl
+                    self.prices = pd.DataFrame()
                 # Always recompute total_value + gain/loss from LIVE prices for accuracy
                 self.total_value = 0.0
                 has_csv_cb = 'cost_basis' in self.holdings.columns and self.holdings['cost_basis'].notna().any()
@@ -365,39 +399,111 @@ class UltraDataEngine:
         return base64.b64encode(buf.read()).decode("utf-8")
 
     # ====================== CHART METHODS (matplotlib) ======================
-    def chart_equity_curve(self):
+    def chart_equity_curve(self, show_sma20=False, show_sma50=True, show_sma200=False,
+                           show_bollinger=False, log_scale=False, show_drawdown_shade=False,
+                           show_pct=False):
         fig, ax = plt.subplots(figsize=(9, 4))
         ax.set_facecolor("#1a1a2e")
         if not self.returns_series.empty:
             cum = (1 + self.returns_series).cumprod()
-            ax.plot(cum.index, cum.values, color="#00ff9d", linewidth=2)
-            ax.fill_between(cum.index, cum.values, alpha=0.15, color="#00ff9d")
+            if show_pct:
+                cum_dollars = (cum / cum.iloc[0] - 1) * 100
+                y_fmt = lambda x, _: f"{x:+.1f}%"
+                title_suffix = " (% Return)"
+            elif self.total_value > 0:
+                scale = self.total_value / cum.iloc[-1] if cum.iloc[-1] != 0 else 1
+                cum_dollars = cum * scale
+                y_fmt = lambda x, _: f"${x:,.0f}"
+                title_suffix = ""
+            else:
+                cum_dollars = cum
+                y_fmt = lambda x, _: f"{x:.4f}"
+                title_suffix = " (Growth of $1)"
+            ax.plot(cum_dollars.index, cum_dollars.values, color="#00ff9d", linewidth=2, label="Portfolio")
+            ax.fill_between(cum_dollars.index, cum_dollars.values, alpha=0.1, color="#00ff9d")
+            # Drawdown shading
+            if show_drawdown_shade:
+                running_max = cum_dollars.cummax()
+                dd_mask = cum_dollars < running_max
+                ax.fill_between(cum_dollars.index, cum_dollars.values, running_max.values,
+                                where=dd_mask, alpha=0.2, color="#ff3366", label="Drawdown")
+            # SMAs
+            if show_sma20 and len(cum_dollars) > 20:
+                ma20 = cum_dollars.rolling(20).mean()
+                ax.plot(ma20.index, ma20.values, color="#00bfff", linewidth=1, alpha=0.7, linestyle="--", label="20d SMA")
+            if show_sma50 and len(cum_dollars) > 50:
+                ma50 = cum_dollars.rolling(50).mean()
+                ax.plot(ma50.index, ma50.values, color="#ffd700", linewidth=1, alpha=0.7, linestyle="--", label="50d SMA")
+            if show_sma200 and len(cum_dollars) > 200:
+                ma200 = cum_dollars.rolling(200).mean()
+                ax.plot(ma200.index, ma200.values, color="#ff9900", linewidth=1, alpha=0.7, linestyle="-.", label="200d SMA")
+            # Bollinger bands
+            if show_bollinger and len(cum_dollars) > 20:
+                ma20_bb = cum_dollars.rolling(20).mean()
+                std20 = cum_dollars.rolling(20).std()
+                upper = ma20_bb + 2 * std20
+                lower = ma20_bb - 2 * std20
+                ax.plot(upper.index, upper.values, color="#9966ff", linewidth=0.8, alpha=0.5, linestyle=":")
+                ax.plot(lower.index, lower.values, color="#9966ff", linewidth=0.8, alpha=0.5, linestyle=":")
+                ax.fill_between(upper.index, upper.values, lower.values, alpha=0.05, color="#9966ff", label="Bollinger")
+            # Peak / current annotations
+            if not show_pct:
+                peak_idx = cum_dollars.idxmax()
+                peak_val = cum_dollars.max()
+                ax.annotate(f"Peak: ${peak_val:,.0f}", xy=(peak_idx, peak_val),
+                            xytext=(10, 10), textcoords='offset points',
+                            color="#ffd700", fontsize=9, fontweight="bold",
+                            arrowprops=dict(arrowstyle='->', color='#ffd700', lw=1))
+                ax.plot(cum_dollars.index[-1], cum_dollars.iloc[-1], 'o', color="#00ff9d", markersize=8, zorder=5)
+                ax.annotate(f"Now: ${cum_dollars.iloc[-1]:,.0f}", xy=(cum_dollars.index[-1], cum_dollars.iloc[-1]),
+                            xytext=(-80, -20), textcoords='offset points',
+                            color="#00ff9d", fontsize=9, fontweight="bold")
+            total_ret = (cum.iloc[-1] / cum.iloc[0] - 1) * 100
+            ax.set_xlabel(f"Total Return: {total_ret:+.1f}%  |  Period: {cum.index[0].strftime('%Y-%m-%d')} to {cum.index[-1].strftime('%Y-%m-%d')}", color="#888888", fontsize=9)
+            import matplotlib.dates as mdates
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+            ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+            fig.autofmt_xdate(rotation=45)
+            if log_scale and not show_pct:
+                ax.set_yscale('log')
+            ax.legend(facecolor="#1a1a2e", edgecolor="#333333", labelcolor="#aaaaaa", fontsize=8, loc='upper left')
         else:
             ax.text(0.5, 0.5, "Import data to see equity curve", ha="center", va="center", color="#aaaaaa", fontsize=14, transform=ax.transAxes)
-        ax.set_title("LIVE EQUITY CURVE", color="#00ff9d", fontsize=14, fontweight="bold")
+            y_fmt = lambda x, _: f"${x:,.0f}"
+            title_suffix = ""
+        ax.set_title(f"PORTFOLIO EQUITY CURVE{title_suffix}", color="#00ff9d", fontsize=14, fontweight="bold")
         ax.tick_params(colors="#aaaaaa")
         for spine in ax.spines.values():
             spine.set_color("#333333")
-        ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"${x:,.2f}" if self.total_value > 1 else f"{x:.2f}"))
+        ax.yaxis.set_major_formatter(mticker.FuncFormatter(y_fmt))
+        ax.grid(True, alpha=0.1, color='#555555')
         return self._fig_to_base64(fig)
 
     def chart_correlation_matrix(self):
-        fig, ax = plt.subplots(figsize=(8, 6))
-        ax.set_facecolor("#1a1a2e")
         corr = self.correlation_matrix()
-        if corr is not None and corr.shape[0] > 1:
+        n = corr.shape[0] if corr is not None else 0
+        # Scale figure size dynamically based on number of assets
+        base = max(8, n * 0.6) if n > 1 else 8
+        font_size = max(5, min(8, 100 // max(n, 1)))
+        fig, ax = plt.subplots(figsize=(base, base * 0.8))
+        ax.set_facecolor("#1a1a2e")
+        if corr is not None and n > 1:
             im = ax.imshow(corr.values, cmap="RdYlGn", vmin=-1, vmax=1, aspect="auto")
-            ax.set_xticks(range(len(corr.columns)))
-            ax.set_yticks(range(len(corr.columns)))
-            ax.set_xticklabels(corr.columns, rotation=45, ha="right", color="#aaaaaa", fontsize=8)
-            ax.set_yticklabels(corr.columns, color="#aaaaaa", fontsize=8)
-            for i in range(len(corr)):
-                for j in range(len(corr)):
-                    ax.text(j, i, f"{corr.values[i, j]:.2f}", ha="center", va="center", color="white", fontsize=7)
+            ax.set_xticks(range(n))
+            ax.set_yticks(range(n))
+            ax.set_xticklabels(corr.columns, rotation=45, ha="right", color="#aaaaaa", fontsize=font_size)
+            ax.set_yticklabels(corr.columns, color="#aaaaaa", fontsize=font_size)
+            # Only show numbers if matrix isn't too large
+            if n <= 25:
+                num_font = max(4, min(7, 80 // max(n, 1)))
+                for i in range(n):
+                    for j in range(n):
+                        ax.text(j, i, f"{corr.values[i, j]:.2f}", ha="center", va="center", color="white", fontsize=num_font)
             fig.colorbar(im, ax=ax, shrink=0.8)
         else:
             ax.text(0.5, 0.5, "Need 2+ assets for correlation matrix", ha="center", va="center", color="#aaaaaa", fontsize=14, transform=ax.transAxes)
         ax.set_title("CORRELATION MATRIX", color="#ffd700", fontsize=14, fontweight="bold")
+        fig.tight_layout()
         return self._fig_to_base64(fig)
 
     def chart_risk_radar(self):
@@ -430,26 +536,45 @@ class UltraDataEngine:
         ax.grid(color="#333333")
         return self._fig_to_base64(fig)
 
-    def chart_candlestick(self):
+    def chart_candlestick(self, period=120, show_sma20=False, show_sma50=False, show_volume=False, chart_type='candle'):
         fig, ax = plt.subplots(figsize=(9, 5))
         ax.set_facecolor("#1a1a2e")
         if not self.returns_series.empty:
-            cum = (1 + self.returns_series).cumprod().tail(120)
-            for i in range(1, len(cum)):
-                color = "#00ff9d" if cum.iloc[i] >= cum.iloc[i - 1] else "#ff3366"
-                ax.bar(i, abs(cum.iloc[i] - cum.iloc[i - 1]), bottom=min(cum.iloc[i], cum.iloc[i - 1]), color=color, width=0.6, alpha=0.8)
-            ax.plot(range(len(cum)), cum.values, color="#ffd700", linewidth=1, alpha=0.5)
-            # projection line
-            if len(cum) > 10:
-                slope = np.polyfit(range(len(cum)), cum.values, 1)
-                proj_x = range(len(cum), len(cum) + 30)
-                proj_y = np.polyval(slope, proj_x)
-                ax.plot(proj_x, proj_y, color="#ffd700", linewidth=2, linestyle="--", alpha=0.7, label="Projection")
-                ax.legend(facecolor="#1a1a2e", edgecolor="#333333", labelcolor="#aaaaaa")
+            cum = (1 + self.returns_series).cumprod().tail(period)
+            if chart_type == 'line':
+                ax.plot(range(len(cum)), cum.values, color="#00ff9d", linewidth=2)
+                ax.fill_between(range(len(cum)), cum.values, alpha=0.1, color="#00ff9d")
+            elif chart_type == 'area':
+                ax.fill_between(range(len(cum)), cum.values, alpha=0.4, color="#00ff9d")
+                ax.plot(range(len(cum)), cum.values, color="#00ff9d", linewidth=1.5)
+            else:
+                for i in range(1, len(cum)):
+                    color = "#00ff9d" if cum.iloc[i] >= cum.iloc[i - 1] else "#ff3366"
+                    ax.bar(i, abs(cum.iloc[i] - cum.iloc[i - 1]), bottom=min(cum.iloc[i], cum.iloc[i - 1]), color=color, width=0.6, alpha=0.8)
+                ax.plot(range(len(cum)), cum.values, color="#ffd700", linewidth=1, alpha=0.5)
+            # SMA overlays
+            if show_sma20 and len(cum) > 20:
+                ma20 = pd.Series(cum.values).rolling(20).mean()
+                ax.plot(range(len(cum)), ma20.values, color="#00bfff", linewidth=1, linestyle="--", alpha=0.7, label="20d SMA")
+            if show_sma50 and len(cum) > 50:
+                ma50 = pd.Series(cum.values).rolling(50).mean()
+                ax.plot(range(len(cum)), ma50.values, color="#ffd700", linewidth=1, linestyle="--", alpha=0.7, label="50d SMA")
+            # Volume bars on secondary axis
+            if show_volume and len(cum) > 1:
+                ax2 = ax.twinx()
+                daily_ret = cum.pct_change().fillna(0).abs()
+                colors_v = ["#00ff9d" if cum.iloc[i] >= cum.iloc[max(0, i-1)] else "#ff3366" for i in range(len(cum))]
+                ax2.bar(range(len(cum)), daily_ret.values * 100, color=colors_v, alpha=0.2, width=0.4)
+                ax2.set_ylim(0, daily_ret.max() * 500)
+                ax2.tick_params(colors="#555555")
+                ax2.set_ylabel("Activity", color="#555555", fontsize=8)
+            if show_sma20 or show_sma50:
+                ax.legend(facecolor="#1a1a2e", edgecolor="#333333", labelcolor="#aaaaaa", fontsize=8)
         else:
             ax.text(0.5, 0.5, "Import data to see market graphs", ha="center", va="center", color="#aaaaaa", fontsize=14, transform=ax.transAxes)
-        ax.set_title("LIVE MARKET GRAPH + PROJECTION", color="#00ff9d", fontsize=14, fontweight="bold")
+        ax.set_title(f"MARKET GRAPH (last {period}d)", color="#00ff9d", fontsize=14, fontweight="bold")
         ax.tick_params(colors="#aaaaaa")
+        ax.grid(True, alpha=0.1, color='#555555')
         for spine in ax.spines.values():
             spine.set_color("#333333")
         return self._fig_to_base64(fig)
@@ -510,22 +635,19 @@ class UltraDataEngine:
             benchmarks = ['SPY', 'QQQ', 'IWM', 'BTC-USD']
         result = []
         try:
-            bm_data = yf.download(benchmarks, period="5y", progress=False, auto_adjust=True)
-            bm_lvl0 = bm_data.columns.get_level_values(0) if isinstance(bm_data.columns, pd.MultiIndex) else bm_data.columns
-            bm_col = 'Close' if 'Close' in bm_lvl0 else ('Adj Close' if 'Adj Close' in bm_lvl0 else None)
-            if bm_col and isinstance(bm_data.columns, pd.MultiIndex):
-                bm_prices = bm_data[bm_col]
-            elif bm_col:
-                bm_prices = bm_data[[bm_col]].rename(columns={bm_col: benchmarks[0]}) if len(benchmarks) == 1 else bm_data
-            else:
-                bm_prices = bm_data
+            # Use DailyData.py for benchmark data
             for bm in benchmarks:
-                if bm in bm_prices.columns:
-                    bm_ret = bm_prices[bm].pct_change().dropna()
+                try:
+                    bm_data = fetch_daily_data(bm, period='5y')
+                    if bm_data is None or bm_data.empty or 'Close' not in bm_data.columns:
+                        continue
+                    bm_close = bm_data['Close'].dropna()
+                    if len(bm_close) < 2:
+                        continue
+                    bm_ret = bm_close.pct_change().dropna()
                     ann_r = float(bm_ret.mean() * 252)
                     ann_v = float(bm_ret.std() * np.sqrt(252))
-                    bm_clean = bm_prices[bm].dropna()
-                    total_r = float((bm_clean.iloc[-1] / bm_clean.iloc[0]) - 1) if len(bm_clean) > 1 else float('nan')
+                    total_r = float((bm_close.iloc[-1] / bm_close.iloc[0]) - 1)
                     if not self.returns_series.empty and len(bm_ret) > 10:
                         corr = float(self.returns_series.corr(bm_ret))
                         if np.isnan(corr):
@@ -533,6 +655,8 @@ class UltraDataEngine:
                     else:
                         corr = None
                     result.append({"symbol": bm, "ann_return": ann_r, "ann_vol": ann_v, "total_return": total_r, "correlation": corr})
+                except Exception:
+                    continue
         except Exception:
             pass
         return result
@@ -554,7 +678,7 @@ class UltraDataEngine:
             })
         return rows
 
-    def chart_benchmark_overlay(self, benchmarks=None, show_portfolio=True, timerange='ALL'):
+    def chart_benchmark_overlay(self, benchmarks=None, show_portfolio=True, timerange='ALL', show_corr_labels=False, show_spread=False):
         if benchmarks is None:
             benchmarks = ['SPY', 'QQQ']
         # Map timerange — always use daily bars to keep stocks & crypto consistent
@@ -600,21 +724,15 @@ class UltraDataEngine:
                 ax.fill_between(cum.index, 1.0, cum.values, alpha=0.08, color='#00ff9d')
         if benchmarks:
             try:
-                bm_data = yf.download(benchmarks, period=yf_period, interval=yf_interval, progress=False, auto_adjust=True)
-                bm_lvl0 = bm_data.columns.get_level_values(0) if isinstance(bm_data.columns, pd.MultiIndex) else bm_data.columns
-                bm_col = 'Close' if 'Close' in bm_lvl0 else ('Adj Close' if 'Adj Close' in bm_lvl0 else None)
-                if bm_col and isinstance(bm_data.columns, pd.MultiIndex):
-                    bm_prices = bm_data[bm_col]
-                elif bm_col:
-                    bm_prices = bm_data[[bm_col]].rename(columns={bm_col: benchmarks[0]}) if len(benchmarks) == 1 else bm_data
-                else:
-                    bm_prices = bm_data
+                # Use DailyData.py for benchmark overlay data
                 fb_idx = 0
-                # Trim benchmark data to N trading days if specified
                 n_days = tr_days.get(timerange.upper())
                 for bm in benchmarks:
-                    if bm in bm_prices.columns:
-                        bm_ser = bm_prices[bm].dropna()
+                    try:
+                        bm_raw = fetch_daily_data(bm, period=yf_period)
+                        if bm_raw is None or bm_raw.empty or 'Close' not in bm_raw.columns:
+                            continue
+                        bm_ser = bm_raw['Close'].dropna()
                         if n_days is not None and len(bm_ser) > n_days:
                             bm_ser = bm_ser.iloc[-n_days:]
                         if len(bm_ser) > 1:
@@ -624,8 +742,50 @@ class UltraDataEngine:
                             if bm not in color_map:
                                 fb_idx += 1
                             ax.plot(bm_cum.index, bm_cum.values, color=c, linewidth=1.5, label=bm, alpha=0.85)
+                    except Exception:
+                        continue
             except Exception:
                 pass
+        # Correlation labels & spread shading
+        if (show_corr_labels or show_spread) and show_portfolio and not self.returns_series.empty and benchmarks:
+            port_ret = self.returns_series.copy()
+            delta = tr_delta.get(timerange.upper())
+            if delta is not None:
+                cutoff = pd.Timestamp.now() - delta
+                port_ret = port_ret.loc[port_ret.index >= cutoff]
+            if not port_ret.empty:
+                port_cum = (1 + port_ret).cumprod()
+                n_days_corr = tr_days.get(timerange.upper())
+                fb_idx2 = 0
+                for bm in benchmarks:
+                    try:
+                        bm_raw2 = fetch_daily_data(bm, period=yf_period)
+                        if bm_raw2 is None or bm_raw2.empty or 'Close' not in bm_raw2.columns:
+                            continue
+                        bm_ser2 = bm_raw2['Close'].dropna()
+                        if n_days_corr is not None and len(bm_ser2) > n_days_corr:
+                            bm_ser2 = bm_ser2.iloc[-n_days_corr:]
+                        bm_ret2 = bm_ser2.pct_change().dropna()
+                        bm_cum2 = (1 + bm_ret2).cumprod()
+                        corr_val = float(port_ret.corr(bm_ret2))
+                        c2 = color_map.get(bm, fallback_colors[fb_idx2 % len(fallback_colors)])
+                        if bm not in color_map:
+                            fb_idx2 += 1
+                        if show_corr_labels and not np.isnan(corr_val):
+                            ax.annotate(f"ρ={corr_val:.2f}", xy=(bm_cum2.index[-1], bm_cum2.iloc[-1]),
+                                        xytext=(5, 0), textcoords='offset points',
+                                        color=c2, fontsize=8, fontweight='bold',
+                                        bbox=dict(boxstyle='round,pad=0.2', facecolor='#1a1a2e', edgecolor=c2, alpha=0.8))
+                        if show_spread:
+                            common_idx = port_cum.index.intersection(bm_cum2.index)
+                            if len(common_idx) > 5:
+                                p_aligned = port_cum.reindex(common_idx)
+                                b_aligned = bm_cum2.reindex(common_idx)
+                                spread = p_aligned - b_aligned
+                                ax.fill_between(common_idx, port_cum.reindex(common_idx).values,
+                                                bm_cum2.reindex(common_idx).values, alpha=0.06, color=c2)
+                    except Exception:
+                        continue
         n_lines = len(ax.get_lines())
         range_label = timerange.upper() if timerange.upper() != 'ALL' else 'All Time'
         title = f'Portfolio vs Benchmarks — {range_label}' if n_lines > 1 else f'Cumulative Returns — {range_label}'
@@ -658,7 +818,9 @@ class UltraDataEngine:
     def beta_vs_market(self):
         if self.returns_series.empty: return 0.0
         try:
-            spy_dl = yf.download("SPY", period="5y", progress=False, auto_adjust=True)
+            spy_dl = fetch_daily_data("SPY", period="5y")
+            if spy_dl is None or spy_dl.empty:
+                return 0.0
             spy = (spy_dl['Close'] if 'Close' in spy_dl.columns else spy_dl.iloc[:, 0]).pct_change().dropna()
             common = self.returns_series.index.intersection(spy.index)
             if len(common) < 30: return 0.0
@@ -774,52 +936,144 @@ class UltraDataEngine:
         total = sum(sectors.values())
         return {k: {"value": v, "pct": v / total * 100 if total > 0 else 0} for k, v in sorted(sectors.items(), key=lambda x: -x[1])}
 
-    def chart_drawdown(self):
+    def chart_drawdown(self, show_dollar=False, show_underwater=False, show_recovery_bands=False):
         fig, ax = plt.subplots(figsize=(9, 4))
         ax.set_facecolor("#1a1a2e")
         dd = self.drawdown_series()
         if not dd.empty:
-            ax.fill_between(dd.index, dd.values, 0, color="#ff3366", alpha=0.4)
-            ax.plot(dd.index, dd.values, color="#ff3366", linewidth=1.5)
+            if show_dollar and self.total_value > 0:
+                cum = (1 + self.returns_series).cumprod()
+                scale = self.total_value / cum.iloc[-1] if cum.iloc[-1] != 0 else 1
+                cum_d = cum * scale
+                dd_vals = cum_d - cum_d.cummax()
+                ax.fill_between(dd_vals.index, dd_vals.values, 0, color="#ff3366", alpha=0.4)
+                ax.plot(dd_vals.index, dd_vals.values, color="#ff3366", linewidth=1.5)
+                ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"${x:,.0f}"))
+                title_extra = " (Dollar)"
+            else:
+                ax.fill_between(dd.index, dd.values, 0, color="#ff3366", alpha=0.4)
+                ax.plot(dd.index, dd.values, color="#ff3366", linewidth=1.5)
+                ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{x:.0%}"))
+                title_extra = " (%)"
+            # Underwater periods shading
+            if show_underwater:
+                in_dd = dd < -0.001
+                start = None
+                for i, (idx, val) in enumerate(zip(dd.index, in_dd)):
+                    if val and start is None:
+                        start = idx
+                    elif not val and start is not None:
+                        ax.axvspan(start, idx, alpha=0.08, color="#ff9900")
+                        start = None
+            # Recovery bands (mark max drawdown point)
+            if show_recovery_bands:
+                min_dd_idx = dd.idxmin()
+                min_dd_val = dd.min()
+                ax.axvline(min_dd_idx, color="#ffd700", linewidth=1, linestyle=":", alpha=0.7)
+                ax.annotate(f"Max DD: {min_dd_val:.1%}", xy=(min_dd_idx, min_dd_val),
+                            xytext=(10, -15), textcoords='offset points',
+                            color="#ffd700", fontsize=9, fontweight="bold",
+                            arrowprops=dict(arrowstyle='->', color='#ffd700', lw=1))
+                # Mark recovery points (where DD returns to 0 after significant drops)
+                recovered = (dd.shift(1) < -0.02) & (dd >= -0.001)
+                for idx in dd.index[recovered]:
+                    ax.axvline(idx, color="#00ff9d", linewidth=0.5, linestyle=":", alpha=0.4)
         else:
             ax.text(0.5, 0.5, "Import data to see drawdown", ha="center", va="center", color="#aaaaaa", fontsize=14, transform=ax.transAxes)
-        ax.set_title("DRAWDOWN CHART", color="#ff3366", fontsize=14, fontweight="bold")
-        ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{x:.0%}"))
+            title_extra = ""
+        ax.set_title(f"DRAWDOWN CHART{title_extra}", color="#ff3366", fontsize=14, fontweight="bold")
         ax.tick_params(colors="#aaaaaa")
+        ax.grid(True, alpha=0.1, color='#555555')
         for spine in ax.spines.values(): spine.set_color("#333333")
         return self._fig_to_base64(fig)
 
-    def chart_holdings_bar(self):
-        fig, ax = plt.subplots(figsize=(9, 5))
+    def chart_holdings_bar(self, mode='$'):
+        fig, ax = plt.subplots(figsize=(9, max(5, 0.35 * len(self.holdings_with_weights() or []))))
         ax.set_facecolor("#1a1a2e")
         hw = self.holdings_with_weights()
         if hw:
-            hw = hw[:15]
             syms = [r['symbol'] for r in hw]
-            vals = [r['market_value'] for r in hw]
-            colors = ["#00ff9d" if r.get('gain_loss', 0) >= 0 else "#ff3366" for r in hw]
-            ax.barh(syms[::-1], vals[::-1], color=colors[::-1], edgecolor="#333333")
+            if mode == '%':
+                vals = [r['weight'] for r in hw]
+                title_text = "HOLDINGS BY WEIGHT (%)"
+                fmt_func = lambda x, _: f"{x:.1f}%"
+            elif mode == 'gl':
+                vals = [r['gain_loss'] for r in hw]
+                title_text = "HOLDINGS BY GAIN/LOSS ($)"
+                fmt_func = lambda x, _: f"${x:,.0f}"
+            elif mode == 'gl%':
+                vals = [r['gain_loss_pct'] for r in hw]
+                title_text = "HOLDINGS BY GAIN/LOSS (%)"
+                fmt_func = lambda x, _: f"{x:+.1f}%"
+            elif mode == 'cb':
+                vals = [r['cost_basis'] for r in hw]
+                title_text = "HOLDINGS BY COST BASIS ($)"
+                fmt_func = lambda x, _: f"${x:,.0f}"
+            else:
+                vals = [r['market_value'] for r in hw]
+                title_text = "HOLDINGS BY MARKET VALUE ($)"
+                fmt_func = lambda x, _: f"${x:,.0f}"
+            if mode in ('gl', 'gl%'):
+                colors = ["#00ff9d" if v >= 0 else "#ff3366" for v in vals]
+            else:
+                colors = ["#00ff9d" if r.get('gain_loss', 0) >= 0 else "#ff3366" for r in hw]
+            bars = ax.barh(syms[::-1], vals[::-1], color=colors[::-1], edgecolor="#333333")
+            for bar, val in zip(bars, vals[::-1]):
+                if mode == '%':
+                    label = f"{val:.1f}%"
+                elif mode == 'gl':
+                    label = f"${val:+,.0f}"
+                elif mode == 'gl%':
+                    label = f"{val:+.1f}%"
+                elif mode == 'cb':
+                    label = f"${val:,.0f}"
+                else:
+                    label = f"${val:,.0f}"
+                x_pos = bar.get_width() + abs(max(vals, key=abs)) * 0.01 if bar.get_width() >= 0 else bar.get_width() - abs(max(vals, key=abs)) * 0.05
+                ax.text(x_pos, bar.get_y() + bar.get_height() / 2,
+                        label, va='center', color='#aaaaaa', fontsize=8)
+            if mode in ('gl', 'gl%'):
+                ax.axvline(0, color="#ffffff", linewidth=0.5, alpha=0.3)
         else:
             ax.text(0.5, 0.5, "Import data to see holdings", ha="center", va="center", color="#aaaaaa", fontsize=14, transform=ax.transAxes)
-        ax.set_title("HOLDINGS BY MARKET VALUE", color="#ffd700", fontsize=14, fontweight="bold")
+            title_text = "HOLDINGS"
+            fmt_func = lambda x, _: f"${x:,.0f}"
+        ax.set_title(title_text, color="#ffd700", fontsize=14, fontweight="bold")
         ax.tick_params(colors="#aaaaaa")
-        ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"${x:,.0f}"))
+        ax.xaxis.set_major_formatter(mticker.FuncFormatter(fmt_func))
         for spine in ax.spines.values(): spine.set_color("#333333")
         return self._fig_to_base64(fig)
 
-    def chart_returns_histogram(self):
+    def chart_returns_histogram(self, show_kde=False, show_cvar=False, show_normal=False, log_returns=False):
         fig, ax = plt.subplots(figsize=(9, 4))
         ax.set_facecolor("#1a1a2e")
         if not self.returns_series.empty:
-            ax.hist(self.returns_series.values, bins=50, color="#00ff9d", alpha=0.7, edgecolor="#333333")
-            ax.axvline(self.returns_series.mean(), color="#ffd700", linewidth=2, linestyle="--", label=f"Mean: {self.returns_series.mean():.4f}")
+            rets = np.log(1 + self.returns_series) if log_returns else self.returns_series
+            ax.hist(rets.values, bins=50, color="#00ff9d", alpha=0.7, edgecolor="#333333", density=show_kde or show_normal)
+            ax.axvline(rets.mean(), color="#ffd700", linewidth=2, linestyle="--", label=f"Mean: {rets.mean():.4f}")
             ax.axvline(0, color="#ffffff", linewidth=1, alpha=0.5)
             var = self.value_at_risk()
             ax.axvline(var, color="#ff3366", linewidth=2, linestyle="--", label=f"VaR 95%: {var:.4f}")
-            ax.legend(facecolor="#1a1a2e", edgecolor="#333333", labelcolor="#aaaaaa")
+            if show_cvar:
+                cvar = self.conditional_var()
+                ax.axvline(cvar, color="#ff9900", linewidth=2, linestyle="-.", label=f"CVaR 95%: {cvar:.4f}")
+            if show_kde:
+                from scipy.stats import gaussian_kde
+                try:
+                    kde = gaussian_kde(rets.dropna().values)
+                    x_range = np.linspace(rets.min(), rets.max(), 200)
+                    ax.plot(x_range, kde(x_range), color="#00bfff", linewidth=2, label="KDE")
+                except Exception:
+                    pass
+            if show_normal:
+                from scipy.stats import norm
+                x_range = np.linspace(rets.min(), rets.max(), 200)
+                ax.plot(x_range, norm.pdf(x_range, rets.mean(), rets.std()), color="#9966ff", linewidth=1.5, linestyle=":", label="Normal fit")
+            ax.legend(facecolor="#1a1a2e", edgecolor="#333333", labelcolor="#aaaaaa", fontsize=8)
         else:
             ax.text(0.5, 0.5, "Import data to see returns distribution", ha="center", va="center", color="#aaaaaa", fontsize=14, transform=ax.transAxes)
-        ax.set_title("RETURNS DISTRIBUTION", color="#00ff9d", fontsize=14, fontweight="bold")
+        title = "LOG RETURNS DISTRIBUTION" if log_returns else "RETURNS DISTRIBUTION"
+        ax.set_title(title, color="#00ff9d", fontsize=14, fontweight="bold")
         ax.tick_params(colors="#aaaaaa")
         for spine in ax.spines.values(): spine.set_color("#333333")
         return self._fig_to_base64(fig)
@@ -839,33 +1093,54 @@ class UltraDataEngine:
         ax.set_title("SECTOR ALLOCATION", color="#ffd700", fontsize=14, fontweight="bold")
         return self._fig_to_base64(fig)
 
-    def chart_rolling_sharpe(self):
+    def chart_rolling_sharpe(self, window=60, show_sortino=False, show_avg=False):
         fig, ax = plt.subplots(figsize=(9, 4))
         ax.set_facecolor("#1a1a2e")
-        rs = self.rolling_sharpe(60)
+        rs = self.rolling_sharpe(window)
         if not rs.empty:
-            ax.plot(rs.index, rs.values, color="#00ff9d", linewidth=1.5)
+            ax.plot(rs.index, rs.values, color="#00ff9d", linewidth=1.5, label=f"{window}d Sharpe")
             ax.axhline(0, color="#ff3366", linewidth=1, linestyle="--", alpha=0.7)
             ax.axhline(1, color="#ffd700", linewidth=1, linestyle="--", alpha=0.5, label="Good (1.0)")
             ax.fill_between(rs.index, rs.values, 0, where=(rs.values > 0), alpha=0.15, color="#00ff9d")
             ax.fill_between(rs.index, rs.values, 0, where=(rs.values < 0), alpha=0.15, color="#ff3366")
-            ax.legend(facecolor="#1a1a2e", edgecolor="#333333", labelcolor="#aaaaaa")
+            if show_avg:
+                avg_val = rs.mean()
+                ax.axhline(avg_val, color="#00bfff", linewidth=1, linestyle="-.", alpha=0.7, label=f"Avg: {avg_val:.2f}")
+            if show_sortino and not self.returns_series.empty:
+                neg_ret = self.returns_series.copy()
+                neg_ret[neg_ret > 0] = 0
+                roll_down = neg_ret.rolling(window).std() * np.sqrt(252)
+                roll_mean = self.returns_series.rolling(window).mean() * 252
+                roll_sort = (roll_mean / roll_down).replace([np.inf, -np.inf], np.nan).dropna()
+                if not roll_sort.empty:
+                    ax.plot(roll_sort.index, roll_sort.values, color="#ff9900", linewidth=1, alpha=0.7, label=f"{window}d Sortino")
+            ax.legend(facecolor="#1a1a2e", edgecolor="#333333", labelcolor="#aaaaaa", fontsize=8)
         else:
-            ax.text(0.5, 0.5, "Need 60+ days for rolling Sharpe", ha="center", va="center", color="#aaaaaa", fontsize=14, transform=ax.transAxes)
-        ax.set_title("ROLLING SHARPE RATIO (60-day)", color="#00ff9d", fontsize=14, fontweight="bold")
+            ax.text(0.5, 0.5, f"Need {window}+ days for rolling Sharpe", ha="center", va="center", color="#aaaaaa", fontsize=14, transform=ax.transAxes)
+        ax.set_title(f"ROLLING SHARPE RATIO ({window}-day)", color="#00ff9d", fontsize=14, fontweight="bold")
         ax.tick_params(colors="#aaaaaa")
         for spine in ax.spines.values(): spine.set_color("#333333")
         return self._fig_to_base64(fig)
 
-    def chart_rolling_volatility(self):
+    def chart_rolling_volatility(self, window=30, show_bands=False, show_regime=False):
         fig, ax = plt.subplots(figsize=(9, 4))
         ax.set_facecolor("#1a1a2e")
-        rv = self.rolling_volatility(30)
+        rv = self.rolling_volatility(window)
         if not rv.empty:
-            ax.plot(rv.index, rv.values, color="#ff9900", linewidth=1.5)
+            ax.plot(rv.index, rv.values, color="#ff9900", linewidth=1.5, label=f"{window}d Vol")
             ax.fill_between(rv.index, rv.values, alpha=0.2, color="#ff9900")
-            ax.axhline(rv.mean(), color="#ffd700", linewidth=1, linestyle="--", label=f"Avg: {rv.mean():.1%}")
-            ax.legend(facecolor="#1a1a2e", edgecolor="#333333", labelcolor="#aaaaaa")
+            avg_vol = rv.mean()
+            ax.axhline(avg_vol, color="#ffd700", linewidth=1, linestyle="--", label=f"Avg: {avg_vol:.1%}")
+            if show_bands:
+                std_vol = rv.std()
+                ax.axhline(avg_vol + std_vol, color="#ff3366", linewidth=0.8, linestyle=":", alpha=0.6, label=f"+1σ: {avg_vol+std_vol:.1%}")
+                ax.axhline(max(0, avg_vol - std_vol), color="#00ff9d", linewidth=0.8, linestyle=":", alpha=0.6, label=f"-1σ: {max(0,avg_vol-std_vol):.1%}")
+            if show_regime:
+                high_thresh = avg_vol + rv.std()
+                low_thresh = max(0, avg_vol - rv.std() * 0.5)
+                ax.fill_between(rv.index, 0, rv.values, where=(rv.values > high_thresh), alpha=0.1, color="#ff3366", label="High Vol")
+                ax.fill_between(rv.index, 0, rv.values, where=(rv.values < low_thresh), alpha=0.1, color="#00ff9d", label="Low Vol")
+            ax.legend(facecolor="#1a1a2e", edgecolor="#333333", labelcolor="#aaaaaa", fontsize=8)
         else:
             ax.text(0.5, 0.5, "Need 30+ days for rolling volatility", ha="center", va="center", color="#aaaaaa", fontsize=14, transform=ax.transAxes)
         ax.set_title("ROLLING VOLATILITY (30-day)", color="#ff9900", fontsize=14, fontweight="bold")
@@ -1030,19 +1305,68 @@ class UltraDataEngine:
         ax.axis('off')
         return self._fig_to_base64(fig)
 
-    def chart_daily_profit(self):
+    def chart_daily_profit(self, mode='$', start_idx=0, end_idx=None, cumulative=False, chart_style='bar', show_avg=False):
         fig, ax = plt.subplots(figsize=(9, 4))
         fig.patch.set_facecolor('#0a0a0a')
         ax.set_facecolor('#121212')
         if not self.returns_series.empty:
-            daily_pnl = self.returns_series * self.total_value if self.total_value > 0 else self.returns_series
-            colors = ['#00ff9d' if v >= 0 else '#ff3366' for v in daily_pnl.values]
-            ax.bar(range(len(daily_pnl)), daily_pnl.values, color=colors, alpha=0.7, width=1.0)
-            ax.axhline(0, color='#555555', linewidth=0.5)
+            if mode == '%':
+                daily_pnl = self.returns_series * 100
+                ylabel_fmt = lambda x, _: f"{x:.2f}%"
+                title_suffix = "(%)"
+            else:
+                daily_pnl = self.returns_series * self.total_value if self.total_value > 0 else self.returns_series
+                ylabel_fmt = lambda x, _: f"${x:,.0f}"
+                title_suffix = "($)"
+            if end_idx is None:
+                end_idx = len(daily_pnl)
+            daily_pnl = daily_pnl.iloc[start_idx:end_idx]
+            if cumulative:
+                cum_pnl = daily_pnl.cumsum()
+                title_suffix = f"Cumulative {title_suffix}"
+                if chart_style == 'line':
+                    ax.plot(cum_pnl.index, cum_pnl.values, color="#00ff9d", linewidth=2)
+                    ax.fill_between(cum_pnl.index, cum_pnl.values, alpha=0.1, color="#00ff9d")
+                elif chart_style == 'area':
+                    ax.fill_between(cum_pnl.index, 0, cum_pnl.values,
+                                    where=(cum_pnl.values >= 0), alpha=0.4, color="#00ff9d")
+                    ax.fill_between(cum_pnl.index, 0, cum_pnl.values,
+                                    where=(cum_pnl.values < 0), alpha=0.4, color="#ff3366")
+                    ax.plot(cum_pnl.index, cum_pnl.values, color="#ffffff", linewidth=1, alpha=0.5)
+                else:
+                    colors = ['#00ff9d' if v >= 0 else '#ff3366' for v in cum_pnl.values]
+                    ax.bar(cum_pnl.index, cum_pnl.values, color=colors, alpha=0.7, width=1.0)
+                ax.axhline(0, color='#555555', linewidth=0.5)
+            else:
+                if chart_style == 'line':
+                    ax.plot(daily_pnl.index, daily_pnl.values, color="#00ff9d", linewidth=1.5, alpha=0.8)
+                    ax.fill_between(daily_pnl.index, daily_pnl.values, 0,
+                                    where=(daily_pnl.values >= 0), alpha=0.15, color="#00ff9d")
+                    ax.fill_between(daily_pnl.index, daily_pnl.values, 0,
+                                    where=(daily_pnl.values < 0), alpha=0.15, color="#ff3366")
+                elif chart_style == 'area':
+                    ax.fill_between(daily_pnl.index, 0, daily_pnl.values,
+                                    where=(daily_pnl.values >= 0), alpha=0.5, color="#00ff9d")
+                    ax.fill_between(daily_pnl.index, 0, daily_pnl.values,
+                                    where=(daily_pnl.values < 0), alpha=0.5, color="#ff3366")
+                else:
+                    colors = ['#00ff9d' if v >= 0 else '#ff3366' for v in daily_pnl.values]
+                    ax.bar(daily_pnl.index, daily_pnl.values, color=colors, alpha=0.7, width=1.0)
+                ax.axhline(0, color='#555555', linewidth=0.5)
+            if show_avg and len(daily_pnl) > 5:
+                avg_val = daily_pnl.mean()
+                ax.axhline(avg_val, color="#ffd700", linewidth=1, linestyle="--", alpha=0.7,
+                           label=f"Avg: {avg_val:+.2f}")
+                ax.legend(facecolor="#1a1a2e", edgecolor="#333333", labelcolor="#aaaaaa", fontsize=8)
+            import matplotlib.dates as mdates
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+            ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+            fig.autofmt_xdate(rotation=45)
+            ax.yaxis.set_major_formatter(mticker.FuncFormatter(ylabel_fmt))
         else:
             ax.text(0.5, 0.5, "Import data to see daily profit", ha="center", va="center", color="#aaaaaa", fontsize=14, transform=ax.transAxes)
-        ax.set_title("DAILY PROFIT / LOSS", color="#00ff9d", fontsize=14, fontweight="bold")
-        ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"${x:,.0f}"))
+            title_suffix = ""
+        ax.set_title(f"DAILY PROFIT / LOSS {title_suffix}", color="#00ff9d", fontsize=14, fontweight="bold")
         ax.tick_params(colors='#aaaaaa')
         for spine in ax.spines.values(): spine.set_color('#333333')
         ax.grid(True, alpha=0.1, color='#555555')
@@ -1202,10 +1526,21 @@ def main(page: ft.Page):
             def _close_dlg(e2):
                 dlg.open = False
                 page.update()
+            # Use page dimensions to make truly fullscreen
+            pw = page.width or 1200
+            ph = page.height or 800
             dlg = ft.AlertDialog(
                 modal=True,
                 title=ft.Text(title, size=20, weight=ft.FontWeight.BOLD, color="#00ff9d"),
-                content=ft.Container(content=img_big, width=960, height=640, bgcolor="#0a0a0a", border_radius=12, padding=10),
+                content=ft.Container(
+                    content=img_big,
+                    width=pw - 60,
+                    height=ph - 120,
+                    bgcolor="#0a0a0a",
+                    border_radius=12,
+                    padding=10,
+                    expand=True,
+                ),
                 actions=[ft.TextButton("CLOSE", on_click=_close_dlg)],
                 actions_alignment=ft.MainAxisAlignment.END,
                 bgcolor="#121212",
@@ -1283,7 +1618,7 @@ def main(page: ft.Page):
             file_list_col.controls.append(ft.Text("No importable files found in this folder.", color="#888888", size=12))
         else:
             sel_all_cb = ft.Checkbox(label=f"Select All ({len(found)} files)", value=False, fill_color="#00ff9d",
-                                      check_color="#0a0a0a", label_style=ft.TextStyle(color="#ffd700", size=12))
+                                      check_color="#0a0a0a", label_text_style=ft.TextStyle(color="#ffd700", size=12))
             def toggle_all(e2):
                 for cb in file_checkboxes.values():
                     cb.value = sel_all_cb.value
@@ -1293,7 +1628,7 @@ def main(page: ft.Page):
             for fname, fpath, ext, size in sorted(found, key=lambda x: x[0]):
                 size_str = f"{size/1024:.0f} KB" if size < 1024*1024 else f"{size/1024/1024:.1f} MB"
                 cb = ft.Checkbox(label=f"{fname}  ({ext}, {size_str})", value=False, fill_color="#00ff9d",
-                                  check_color="#0a0a0a", label_style=ft.TextStyle(color="#ffffff", size=11))
+                                  check_color="#0a0a0a", label_text_style=ft.TextStyle(color="#ffffff", size=11))
                 file_checkboxes[fpath] = cb
                 file_list_col.controls.append(cb)
         page.update()
@@ -1303,6 +1638,19 @@ def main(page: ft.Page):
         ft.Text("", size=12, color="#00ff9d", italic=True),
     ], spacing=8, visible=False)
 
+    # Main screen overlay for loading during imports
+    main_loading_overlay = ft.Container(
+        content=ft.Column([
+            ft.ProgressRing(width=60, height=60, stroke_width=4, color="#00ff9d"),
+            ft.Text("Importing data...", size=20, color="#00ff9d", weight=ft.FontWeight.BOLD),
+            ft.Text("Please wait while files are processed", size=14, color="#888888"),
+        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, alignment=ft.MainAxisAlignment.CENTER, spacing=16),
+        bgcolor=ft.Colors.with_opacity(0.85, "#0a0a0a"),
+        expand=True,
+        visible=False,
+        alignment=ft.Alignment(0, 0),
+    )
+
     def do_import(e):
         # Collect checked files, or fall back to manual path
         selected = [fp for fp, cb in file_checkboxes.items() if cb.value]
@@ -1310,10 +1658,11 @@ def main(page: ft.Page):
         if not selected and not raw:
             show_snack("Select files or enter a folder path to import.", "#663300")
             return
-        # Show loading indicator
+        # Show loading indicator on import bar AND main screen overlay
         import_status.controls[0].visible = True
         import_status.controls[1].value = f"Importing {len(selected) if selected else 'all'} file(s)..."
         import_status.visible = True
+        main_loading_overlay.visible = True
         page.update()
         def thread_func():
             try:
@@ -1336,6 +1685,7 @@ def main(page: ft.Page):
                     fmts = set(s['format'] for s in summary)
                     import_status.controls[0].visible = False
                     import_status.controls[1].value = f"✓ Imported {count:,} records from {files_n} file(s)"
+                    main_loading_overlay.visible = False
                     page.update()
                     show_snack(f"Imported {count:,} records from {files_n} file(s) ({', '.join(fmts)})", "#006644")
                     load_category(nav_rail.selected_index)
@@ -1343,12 +1693,14 @@ def main(page: ft.Page):
                     import_status.controls[0].visible = False
                     import_status.controls[1].value = "No valid data found."
                     import_status.controls[1].color = "#ff3366"
+                    main_loading_overlay.visible = False
                     page.update()
                     show_snack("No valid data found in selected files.", "#663300")
             except Exception as ex:
                 import_status.controls[0].visible = False
                 import_status.controls[1].value = f"Error: {ex}"
                 import_status.controls[1].color = "#ff3366"
+                main_loading_overlay.visible = False
                 page.update()
                 show_snack(f"Import error: {ex}", "#663300")
         threading.Thread(target=thread_func, daemon=True).start()
@@ -1430,9 +1782,9 @@ def main(page: ft.Page):
             "Dashboard (3 tabs)": "15 KPIs (value, G/L, return, vol, Sharpe, Sortino, profit factor, VaR, win rate, streaks, recovery), equity curve, summary stats, portfolio health score gauge",
             "Portfolio (6 tabs)": "Holdings table (qty/price/value/weight/cost/G-L/%), bar chart, weight pie, top gainers & losers, trade log with dates",
             "Analysis (12 tabs)": "Correlation matrix, market graphs, portfolio DNA fingerprint, constellation chart, efficient frontier, sector allocation pie, performance attribution, returns distribution histogram, monthly heatmap, benchmark comparison (SPY/QQQ/DIA/IWM), correlation deep-dive (pairwise), risk-adjusted returns (CAPM alpha/beta/Treynor/info ratio)",
-            "Planning (9 tabs)": "Goal probability (Monte Carlo), time machine slider, advanced planner (inflation/tax/income/expenses), FIRE calculator (lean/regular/fat/coast), growth projection, monthly comparison, dream life architect, income tracker (dividends), what-if scenario (4 interactive sliders)",
+            "Planning (7 tabs)": "Goal probability (Monte Carlo), advanced planner (inflation/tax/income/expenses), FIRE calculator (lean/regular/fat/coast), monthly comparison, dream life architect, income tracker (dividends), what-if scenario (4 interactive sliders)",
             "Risk (10 tabs)": "Risk radar chart, stress test lab, emotional risk gauge, diversification score, market regime detection, drawdown chart, rolling Sharpe (60d), rolling volatility (30d), gain/loss waterfall, win/loss streaks & recovery time",
-            "AI & Tools (7 tabs)": "Smart brain analysis, AI co-pilot chat, voice command simulation, Monte Carlo paths, daily diary, portfolio rebalancer (max Sharpe), tax-loss harvesting optimizer",
+            "AI & Tools (7 tabs)": "Smart brain analysis, AI co-pilot chat, voice command simulation, Monte Carlo paths, trade journal, portfolio rebalancer (max Sharpe), tax-loss harvesting optimizer",
             "Settings (1 tab)": "Theme toggle, risk profile configuration",
         }
         for cat, desc in features.items():
@@ -1680,9 +2032,15 @@ def main(page: ft.Page):
         pf = data.profit_factor()
         wl = data.win_loss_streaks()
         rec = data.recovery_time()
+        ra = data.risk_adjusted_returns()
+        hs = data.portfolio_health_score()
+        hp = data.holding_period_analysis()
+        tf = data.trade_frequency_analysis()
+
         vol = s.get("ann_volatility", 0)
         sharpe = s.get("sharpe", 0)
         sortino = s.get("sortino", 0)
+        calmar = s.get("calmar", 0)
         max_dd = s.get("max_drawdown", 0)
         total_gl = s.get("total_gain_loss", 0)
         gl_color = "#00ff9d" if total_gl >= 0 else "#ff3366"
@@ -1692,48 +2050,146 @@ def main(page: ft.Page):
         worst = s.get("worst_day", 0)
         win_rate = s.get("win_rate", 0)
         var95 = s.get("var_95", 0)
+        cvar95 = s.get("cvar_95", 0)
         gl_pct = s.get("total_gain_pct", 0)
+        skew = s.get("skewness", 0)
+        kurt = s.get("kurtosis", 0)
+        pos_days = s.get("positive_days", 0)
+        neg_days = s.get("negative_days", 0)
+        beta = ra.get("beta", 0)
+        alpha = ra.get("alpha", 0)
+        treynor = ra.get("treynor", 0)
+        info_ratio = ra.get("info_ratio", 0)
+        total_cb = s.get("total_cost_basis", 0)
+        journey_days = hp.get('days', 0)
+        journey_years = hp.get('years', 0)
+        total_trades = tf.get('total', 0)
+        grade = hs.get('grade', 'N/A')
+        health_score = hs.get('score', 0)
+
         def _dk(label, val, color="#ffd700"):
             return ft.Container(content=ft.Column([ft.Text(label, size=10, color="#aaaaaa"), ft.Text(str(val), size=18, weight=ft.FontWeight.BOLD, color=color)], spacing=2), bgcolor="#1a1a2e", padding=10, border_radius=12, expand=True)
+        def _dk_sm(label, val, color="#ffd700"):
+            return ft.Container(content=ft.Column([ft.Text(label, size=9, color="#aaaaaa"), ft.Text(str(val), size=15, weight=ft.FontWeight.BOLD, color=color)], spacing=1), bgcolor="#1a1a2e", padding=8, border_radius=10, expand=True)
+        def _fv(v, fmt=".2f"):
+            if v == 0: return "N/A"
+            return f"{v:{fmt}}"
+
+        # Row 1: Portfolio value overview
         kpi_row1 = ft.Row([
             _dk("Total Value", f"${data.total_value:,.0f}", "#ffd700"),
+            _dk("Cost Basis", f"${total_cb:,.0f}" if total_cb else "N/A", "#aaaaaa"),
             _dk("Total G/L", f"${total_gl:,.0f}" if total_gl != 0 else "N/A", gl_color),
             _dk("G/L %", f"{gl_pct:+.1f}%" if gl_pct != 0 else "N/A", gl_color),
             _dk("Ann. Return", f"{ann_ret:.1%}" if ann_ret != 0 else "N/A", "#00ff9d" if ann_ret >= 0 else "#ff3366"),
-            _dk("Holdings", str(n_hold) if n_hold > 0 else "0"),
         ], spacing=6)
+        # Row 2: Risk metrics
         kpi_row2 = ft.Row([
             _dk("Volatility", f"{vol:.1%}" if vol != 0 else "N/A", "#ff3366"),
-            _dk("Sharpe", f"{sharpe:.2f}" if sharpe != 0 else "N/A", "#00ff9d" if sharpe > 0 else "#ff3366"),
-            _dk("Sortino", f"{sortino:.2f}" if sortino != 0 else "N/A", "#00ff9d" if sortino > 0 else "#ff3366"),
+            _dk("Sharpe", _fv(sharpe), "#00ff9d" if sharpe > 0 else "#ff3366"),
+            _dk("Sortino", _fv(sortino), "#00ff9d" if sortino > 0 else "#ff3366"),
+            _dk("Calmar", _fv(calmar), "#00ff9d" if calmar > 0 else "#ff3366"),
             _dk("Max DD", f"{max_dd:.1%}" if max_dd != 0 else "N/A", "#ff3366"),
-            _dk("Profit Factor", f"{pf:.2f}" if pf != 0 else "N/A", "#00ff9d" if pf > 1 else "#ff3366"),
         ], spacing=6)
+        # Row 3: Trading stats
         kpi_row3 = ft.Row([
+            _dk("Profit Factor", f"{pf:.2f}" if pf != 0 else "N/A", "#00ff9d" if pf > 1 else "#ff3366"),
             _dk("Win Rate", f"{win_rate:.0%}" if win_rate != 0 else "N/A", "#00ff9d" if win_rate > 0.5 else "#ff3366"),
             _dk("Best Day", f"{best:.2%}" if best != 0 else "N/A", "#00ff9d"),
             _dk("Worst Day", f"{worst:.2%}" if worst != 0 else "N/A", "#ff3366"),
-            _dk("VaR 95%", f"{var95:.2%}" if var95 != 0 else "N/A", "#ff3366"),
             _dk("Win Streak", f"{wl['longest_win']}d" if wl['longest_win'] > 0 else "N/A", "#00ff9d"),
         ], spacing=6)
-        # Recovery info
-        rec_text = f"Max recovery: {rec['max_recovery_days']}d" if rec['max_recovery_days'] > 0 else "No drawdown recovery data"
+        # Row 4: Risk deep dive
+        kpi_row4 = ft.Row([
+            _dk("VaR 95%", f"{var95:.2%}" if var95 != 0 else "N/A", "#ff3366"),
+            _dk("CVaR 95%", f"{cvar95:.2%}" if cvar95 != 0 else "N/A", "#ff3366"),
+            _dk("Beta (SPY)", _fv(beta), "#ffd700"),
+            _dk("Alpha (CAPM)", f"{alpha:.2%}" if alpha != 0 else "N/A", "#00ff9d" if alpha > 0 else "#ff3366"),
+            _dk("Treynor", _fv(treynor), "#00ff9d" if treynor > 0 else "#ff3366"),
+        ], spacing=6)
+        # Row 5: Distribution & Advanced
+        kpi_row5 = ft.Row([
+            _dk_sm("Skewness", _fv(skew, ".3f"), "#00ff9d" if skew > 0 else "#ff3366"),
+            _dk_sm("Kurtosis", _fv(kurt, ".3f"), "#ffd700"),
+            _dk_sm("Positive Days", str(pos_days) if pos_days else "N/A", "#00ff9d"),
+            _dk_sm("Negative Days", str(neg_days) if neg_days else "N/A", "#ff3366"),
+            _dk_sm("Info Ratio", _fv(info_ratio), "#00ff9d" if info_ratio > 0 else "#ff3366"),
+            _dk_sm("Loss Streak", f"{wl['longest_loss']}d" if wl['longest_loss'] > 0 else "N/A", "#ff3366"),
+        ], spacing=4)
+        # Row 6: Portfolio overview
+        kpi_row6 = ft.Row([
+            _dk_sm("Holdings", str(n_hold) if n_hold > 0 else "0", "#ffd700"),
+            _dk_sm("Total Trades", f"{total_trades:,}" if total_trades else "N/A", "#9966ff"),
+            _dk_sm("Journey", f"{journey_years}yr ({journey_days:,}d)" if journey_days else "N/A", "#00bfff"),
+            _dk_sm("Health Grade", grade, "#00ff9d" if health_score >= 65 else "#ffd700" if health_score >= 50 else "#ff3366"),
+            _dk_sm("Health Score", f"{health_score}/100", "#00ff9d" if health_score >= 65 else "#ffd700" if health_score >= 50 else "#ff3366"),
+            _dk_sm("Current Streak", f"{wl['current_streak']}d ({wl['current_type']})" if wl['current_type'] != 'N/A' else "N/A", "#00ff9d" if wl.get('current_type') == 'win' else "#ff3366"),
+        ], spacing=4)
+
+        # Recovery & drawdown status
+        rec_parts = []
+        if rec['max_recovery_days'] > 0:
+            rec_parts.append(f"Max recovery: {rec['max_recovery_days']}d")
+        if rec.get('avg_recovery_days', 0) > 0:
+            rec_parts.append(f"Avg recovery: {rec['avg_recovery_days']:.0f}d")
         if rec['currently_in_drawdown']:
-            rec_text += f"  |  Currently in drawdown: {rec['current_dd_days']}d"
-        return _card(ft.Column([
+            rec_parts.append(f"IN DRAWDOWN: {rec['current_dd_days']}d")
+        rec_text = "  |  ".join(rec_parts) if rec_parts else "No drawdown recovery data"
+
+        # --- Equity curve with toggles ---
+        eq_state = {'sma20': False, 'sma50': True, 'sma200': False, 'bb': False, 'log': False, 'dd': False, 'pct': False}
+        eq_chart = ft.Container(content=_chart_image(data.chart_equity_curve(**{
+            'show_sma20': eq_state['sma20'], 'show_sma50': eq_state['sma50'], 'show_sma200': eq_state['sma200'],
+            'show_bollinger': eq_state['bb'], 'log_scale': eq_state['log'],
+            'show_drawdown_shade': eq_state['dd'], 'show_pct': eq_state['pct']})))
+        def _eq_refresh():
+            eq_chart.content = _chart_image(data.chart_equity_curve(
+                show_sma20=eq_state['sma20'], show_sma50=eq_state['sma50'], show_sma200=eq_state['sma200'],
+                show_bollinger=eq_state['bb'], log_scale=eq_state['log'],
+                show_drawdown_shade=eq_state['dd'], show_pct=eq_state['pct']))
+            page.update()
+        def _eq_tog(key):
+            def handler(e):
+                eq_state[key] = e.control.value
+                _eq_refresh()
+            return handler
+        def _sw(label, key, val=False):
+            return ft.Switch(label=label, value=val, active_color="#00ff9d", label_text_style=ft.TextStyle(size=11, color="#aaaaaa"), on_change=_eq_tog(key))
+        eq_toggles = ft.Row([
+            _sw("20d SMA", "sma20"), _sw("50d SMA", "sma50", True), _sw("200d SMA", "sma200"),
+            _sw("Bollinger", "bb"), _sw("Log Scale", "log"), _sw("DD Shade", "dd"), _sw("% View", "pct"),
+        ], spacing=8, scroll=ft.ScrollMode.AUTO)
+        col = ft.Column([
             ft.Text("DASHBOARD", size=22, weight=ft.FontWeight.BOLD, color="#00ff9d"),
             ft.Text(f"Last updated: {datetime.now().strftime('%B %d, %Y %I:%M %p')}", size=11, color="#666666"),
+            ft.Text("PORTFOLIO VALUE", size=13, weight=ft.FontWeight.BOLD, color="#ffd700"),
             kpi_row1,
+            ft.Text("RISK METRICS", size=13, weight=ft.FontWeight.BOLD, color="#ff3366"),
             kpi_row2,
+            ft.Text("TRADING PERFORMANCE", size=13, weight=ft.FontWeight.BOLD, color="#00ff9d"),
             kpi_row3,
+            ft.Text("RISK DEEP DIVE", size=13, weight=ft.FontWeight.BOLD, color="#ff9900"),
+            kpi_row4,
+            ft.Text("DISTRIBUTION & ADVANCED", size=13, weight=ft.FontWeight.BOLD, color="#9966ff"),
+            kpi_row5,
+            ft.Text("PORTFOLIO OVERVIEW", size=13, weight=ft.FontWeight.BOLD, color="#00bfff"),
+            kpi_row6,
+            ft.Divider(height=1, color="#333333"),
             ft.Text(rec_text, size=11, color="#888888", italic=True),
-            _chart_image(data.chart_equity_curve()),
-        ], scroll=ft.ScrollMode.AUTO, spacing=10))
+            ft.Divider(height=1, color="#333333"),
+            ft.Text("EQUITY CURVE", size=15, weight=ft.FontWeight.BOLD, color="#00ff9d"),
+            eq_toggles,
+            eq_chart,
+        ], scroll=ft.ScrollMode.AUTO, spacing=8)
+
+        return _card(col)
 
     # data_organizer_tab removed
 
     def portfolio_tab():
         holdings_data = data.holdings_with_weights()
+        def _pk(label, val, color="#ffd700"):
+            return ft.Container(content=ft.Column([ft.Text(label, size=9, color="#aaaaaa"), ft.Text(str(val), size=15, weight=ft.FontWeight.BOLD, color=color)], spacing=1), bgcolor="#1a1a2e", padding=8, border_radius=10, expand=True)
         if not holdings_data:
             content = ft.Text("No holdings loaded. Import data first.", size=20, color="#aaaaaa")
         else:
@@ -1765,50 +2221,299 @@ def main(page: ft.Page):
                 heading_row_color="#1a1a2e",
             )
         total_gl = sum(h['gain_loss'] for h in holdings_data) if holdings_data else 0
+        total_val = data.total_value
+        total_cb = sum(h['cost_basis'] for h in holdings_data) if holdings_data else 0
         gl_color = "#00ff9d" if total_gl >= 0 else "#ff3366"
-        return _card(ft.Column([
-            ft.Text("PORTFOLIO HOLDINGS", size=22, weight=ft.FontWeight.BOLD, color="#00ff9d"),
-            ft.Row([
-                ft.Text(f"Total Value: ${data.total_value:,.0f}", size=16, color="#ffd700"),
-                ft.Text(f"Total G/L: ${total_gl:,.0f}", size=16, color=gl_color),
-                ft.Text(f"Holdings: {len(holdings_data)}", size=16, color="#ffffff"),
-            ], spacing=20),
-            content,
-        ], scroll=ft.ScrollMode.AUTO, spacing=15))
+        n = len(holdings_data)
+        # Concentration metrics
+        weights = [h['weight'] / 100.0 for h in holdings_data] if holdings_data else []
+        hhi = sum(w ** 2 for w in weights) * 10000 if weights else 0
+        eff_n = 1.0 / sum(w ** 2 for w in weights) if weights and sum(w ** 2 for w in weights) > 0 else 0
+        top5_wt = sum(sorted(weights, reverse=True)[:5]) * 100 if weights else 0
+        max_wt = max(weights) * 100 if weights else 0
+        winners = sum(1 for h in holdings_data if h['gain_loss'] >= 0) if holdings_data else 0
+        losers = n - winners
+        avg_gl_pct = np.mean([h['gain_loss_pct'] for h in holdings_data]) if holdings_data else 0
+        median_gl_pct = np.median([h['gain_loss_pct'] for h in holdings_data]) if holdings_data else 0
+        best_h = max(holdings_data, key=lambda h: h['gain_loss_pct']) if holdings_data else None
+        worst_h = min(holdings_data, key=lambda h: h['gain_loss_pct']) if holdings_data else None
+        biggest_h = max(holdings_data, key=lambda h: h['market_value']) if holdings_data else None
+
+        col = ft.Column(scroll=ft.ScrollMode.AUTO, spacing=10)
+        col.controls.append(ft.Text("PORTFOLIO HOLDINGS", size=22, weight=ft.FontWeight.BOLD, color="#00ff9d"))
+        # Summary KPIs
+        col.controls.append(ft.Row([
+            _pk("Total Value", f"${total_val:,.0f}", "#ffd700"),
+            _pk("Cost Basis", f"${total_cb:,.0f}" if total_cb else "N/A", "#aaaaaa"),
+            _pk("Total G/L", f"${total_gl:,.0f}" if total_gl != 0 else "N/A", gl_color),
+            _pk("G/L %", f"{(total_gl/total_cb*100):+.1f}%" if total_cb else "N/A", gl_color),
+            _pk("Holdings", str(n), "#ffffff"),
+        ], spacing=4))
+        col.controls.append(ft.Row([
+            _pk("Winners", str(winners), "#00ff9d"),
+            _pk("Losers", str(losers), "#ff3366"),
+            _pk("Avg G/L %", f"{avg_gl_pct:+.1f}%", "#00ff9d" if avg_gl_pct >= 0 else "#ff3366"),
+            _pk("Median G/L %", f"{median_gl_pct:+.1f}%", "#00ff9d" if median_gl_pct >= 0 else "#ff3366"),
+            _pk("Win Ratio", f"{winners/n:.0%}" if n > 0 else "N/A", "#00ff9d" if winners > losers else "#ff3366"),
+        ], spacing=4))
+        col.controls.append(ft.Divider(height=1, color="#333333"))
+        col.controls.append(ft.Text("CONCENTRATION ANALYSIS", size=15, weight=ft.FontWeight.BOLD, color="#ff9900"))
+        col.controls.append(ft.Row([
+            _pk("HHI Index", f"{hhi:.0f}", "#ff9900" if hhi > 2500 else "#ffd700" if hhi > 1500 else "#00ff9d"),
+            _pk("Effective # Bets", f"{eff_n:.1f}", "#00ff9d" if eff_n > 5 else "#ffd700"),
+            _pk("Top 5 Weight", f"{top5_wt:.1f}%", "#ff9900" if top5_wt > 80 else "#ffd700"),
+            _pk("Max Position", f"{max_wt:.1f}%", "#ff3366" if max_wt > 30 else "#ffd700"),
+            _pk("Largest", biggest_h['symbol'] if biggest_h else "N/A", "#ffd700"),
+        ], spacing=4))
+        col.controls.append(ft.Text("HHI < 1500 = diversified  |  1500-2500 = moderate  |  > 2500 = concentrated", size=10, color="#666666", italic=True))
+        col.controls.append(ft.Divider(height=1, color="#333333"))
+        # Best/Worst performers
+        if best_h and worst_h:
+            col.controls.append(ft.Text("TOP & BOTTOM PERFORMERS", size=15, weight=ft.FontWeight.BOLD, color="#ffd700"))
+            col.controls.append(ft.Row([
+                _pk(f"Best: {best_h['symbol']}", f"{best_h['gain_loss_pct']:+.1f}% (${best_h['gain_loss']:,.0f})", "#00ff9d"),
+                _pk(f"Worst: {worst_h['symbol']}", f"{worst_h['gain_loss_pct']:+.1f}% (${worst_h['gain_loss']:,.0f})", "#ff3366"),
+            ], spacing=4))
+            col.controls.append(ft.Divider(height=1, color="#333333"))
+        col.controls.append(content)
+        return _card(col)
 
     def analysis_tab():
+        corr_container = ft.Container(
+            content=ft.Text("Click 'Compute' to generate correlation matrix", size=14, color="#aaaaaa"),
+            padding=10,
+        )
+        def _compute(e):
+            corr_container.content = ft.Column([
+                ft.ProgressRing(width=30, height=30, stroke_width=3, color="#00ff9d"),
+                ft.Text("Computing correlation matrix...", size=12, color="#888888"),
+            ], horizontal_alignment=ft.CrossAxisAlignment.CENTER)
+            page.update()
+            try:
+                corr_container.content = _chart_image(data.chart_correlation_matrix())
+            except Exception as ex:
+                corr_container.content = ft.Text(f"Error: {ex}", size=14, color="#ff3366")
+            page.update()
         return _card(ft.Column([
             ft.Text("ADVANCED ANALYSIS", size=22, weight=ft.FontWeight.BOLD, color="#00ff9d"),
-            _chart_image(data.chart_correlation_matrix()),
+            ft.Button("COMPUTE", bgcolor="#00ff9d", color="#0a0a0a",
+                       style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=8)),
+                       on_click=_compute),
+            corr_container,
         ], scroll=ft.ScrollMode.AUTO, spacing=15))
 
     def market_graphs_tab():
+        mg_opts = {'period': 120, 'sma20': False, 'sma50': False, 'volume': False, 'type': 'candle'}
+        mg_chart_c = ft.Container(content=_chart_image(data.chart_candlestick()))
+        def _mg_refresh():
+            mg_chart_c.content = _chart_image(data.chart_candlestick(
+                period=mg_opts['period'], show_sma20=mg_opts['sma20'], show_sma50=mg_opts['sma50'],
+                show_volume=mg_opts['volume'], chart_type=mg_opts['type']))
+            page.update()
+        def _mg_tog(key):
+            def handler(e):
+                mg_opts[key] = e.control.value
+                _mg_refresh()
+            return handler
+        def _mg_period(e):
+            try: mg_opts['period'] = int(e.control.value)
+            except: mg_opts['period'] = 120
+            _mg_refresh()
+        def _mg_type(e):
+            mg_opts['type'] = e.control.value
+            _mg_refresh()
+        mg_toggles = ft.Row([
+            ft.Text("Period:", size=11, color="#aaaaaa"),
+            ft.Dropdown(value="120", width=90, options=[
+                ft.dropdown.Option("30", "30d"), ft.dropdown.Option("60", "60d"),
+                ft.dropdown.Option("120", "120d"), ft.dropdown.Option("252", "1yr"),
+            ], on_select=_mg_period, border_color="#00ff9d", color="#ffffff", bgcolor="#1a1a2e"),
+            ft.Text("Style:", size=11, color="#aaaaaa"),
+            ft.Dropdown(value="candle", width=100, options=[
+                ft.dropdown.Option("candle", "Candle"), ft.dropdown.Option("line", "Line"),
+                ft.dropdown.Option("area", "Area"),
+            ], on_select=_mg_type, border_color="#00ff9d", color="#ffffff", bgcolor="#1a1a2e"),
+            ft.Switch(label="20d SMA", value=False, active_color="#00bfff",
+                      label_text_style=ft.TextStyle(size=11, color="#aaaaaa"), on_change=_mg_tog('sma20')),
+            ft.Switch(label="50d SMA", value=False, active_color="#ffd700",
+                      label_text_style=ft.TextStyle(size=11, color="#aaaaaa"), on_change=_mg_tog('sma50')),
+            ft.Switch(label="Volume", value=False, active_color="#ff9900",
+                      label_text_style=ft.TextStyle(size=11, color="#aaaaaa"), on_change=_mg_tog('volume')),
+        ], spacing=8, scroll=ft.ScrollMode.AUTO)
         return _card(ft.Column([
-            ft.Text("LIVE MARKET GRAPHS + PROJECTION", size=22, weight=ft.FontWeight.BOLD, color="#00ff9d"),
-            _chart_image(data.chart_candlestick()),
+            ft.Text("LIVE MARKET GRAPHS", size=22, weight=ft.FontWeight.BOLD, color="#00ff9d"),
+            mg_toggles,
+            mg_chart_c,
         ], scroll=ft.ScrollMode.AUTO, spacing=15))
 
     # goals_tab, smart_brain_tab, ai_chat_tab removed
 
     def risk_radar_tab():
-        return _card(ft.Column([
-            ft.Text("HOLOGRAPHIC RISK RADAR", size=22, weight=ft.FontWeight.BOLD, color="#00ff9d"),
-            _chart_image(data.chart_risk_radar()),
-        ], scroll=ft.ScrollMode.AUTO, spacing=15))
+        s = data.portfolio_summary_stats()
+        ra = data.risk_adjusted_returns()
+        rs = data.returns_series
+        def _kpi(label, value, color="#ffd700"):
+            return ft.Container(content=ft.Column([ft.Text(label, size=10, color="#aaaaaa"), ft.Text(str(value), size=16, weight=ft.FontWeight.BOLD, color=color)], spacing=2), bgcolor="#1a1a2e", padding=10, border_radius=10, expand=True)
+        radar_container = ft.Container(
+            content=ft.Text("Click 'Compute' to generate risk radar", size=14, color="#aaaaaa"),
+            padding=10,
+        )
+        def _compute(e):
+            radar_container.content = ft.Column([
+                ft.ProgressRing(width=30, height=30, stroke_width=3, color="#00ff9d"),
+                ft.Text("Computing risk radar...", size=12, color="#888888"),
+            ], horizontal_alignment=ft.CrossAxisAlignment.CENTER)
+            page.update()
+            try:
+                radar_container.content = _chart_image(data.chart_risk_radar())
+            except Exception as ex:
+                radar_container.content = ft.Text(f"Error: {ex}", size=14, color="#ff3366")
+            page.update()
 
-    # portfolio_dna_tab, emotional_gauge_tab, time_machine_tab, daily_diary_tab, dream_architect_tab, stress_lab_tab removed
+        # Compute advanced risk metrics inline
+        vol = s.get("ann_volatility", 0)
+        max_dd = s.get("max_drawdown", 0)
+        var95 = s.get("var_95", 0)
+        cvar95 = s.get("cvar_95", 0)
+        sharpe = s.get("sharpe", 0)
+        sortino = s.get("sortino", 0)
+        calmar = s.get("calmar", 0)
+        beta = ra.get("beta", 0)
+        alpha = ra.get("alpha", 0)
+        # Tail risk
+        tail_ratio_val = 0
+        if not rs.empty and len(rs) > 10:
+            p95 = float(np.percentile(rs, 95))
+            p5 = float(np.percentile(rs, 5))
+            tail_ratio_val = abs(p95 / p5) if p5 != 0 else 0
+        # Downside deviation
+        downside_dev = float(rs[rs < 0].std() * np.sqrt(252)) if not rs.empty and (rs < 0).any() else 0
+
+        col = ft.Column(scroll=ft.ScrollMode.AUTO, spacing=10)
+        col.controls.append(ft.Text("HOLOGRAPHIC RISK RADAR", size=22, weight=ft.FontWeight.BOLD, color="#00ff9d"))
+        col.controls.append(ft.Text("Multi-dimensional risk assessment across all portfolio dimensions", size=12, color="#aaaaaa"))
+        col.controls.append(ft.Text("RISK OVERVIEW", size=15, weight=ft.FontWeight.BOLD, color="#ff3366"))
+        col.controls.append(ft.Row([
+            _kpi("Volatility", f"{vol:.1%}" if vol else "N/A", "#ff3366"),
+            _kpi("Max Drawdown", f"{max_dd:.1%}" if max_dd else "N/A", "#ff3366"),
+            _kpi("VaR 95%", f"{var95:.2%}" if var95 else "N/A", "#ff3366"),
+            _kpi("CVaR 95%", f"{cvar95:.2%}" if cvar95 else "N/A", "#ff3366"),
+        ], spacing=6))
+        col.controls.append(ft.Text("RISK-ADJUSTED PERFORMANCE", size=15, weight=ft.FontWeight.BOLD, color="#ffd700"))
+        col.controls.append(ft.Row([
+            _kpi("Sharpe", f"{sharpe:.2f}" if sharpe else "N/A", "#00ff9d" if sharpe > 0 else "#ff3366"),
+            _kpi("Sortino", f"{sortino:.2f}" if sortino else "N/A", "#00ff9d" if sortino > 0 else "#ff3366"),
+            _kpi("Calmar", f"{calmar:.2f}" if calmar else "N/A", "#00ff9d" if calmar > 0 else "#ff3366"),
+            _kpi("Tail Ratio", f"{tail_ratio_val:.2f}" if tail_ratio_val else "N/A", "#00ff9d" if tail_ratio_val > 1 else "#ff3366"),
+        ], spacing=6))
+        col.controls.append(ft.Text("MARKET SENSITIVITY", size=15, weight=ft.FontWeight.BOLD, color="#00bfff"))
+        col.controls.append(ft.Row([
+            _kpi("Beta (SPY)", f"{beta:.2f}" if beta else "N/A", "#ffd700"),
+            _kpi("Alpha (CAPM)", f"{alpha:.2%}" if alpha else "N/A", "#00ff9d" if alpha > 0 else "#ff3366"),
+            _kpi("Downside Dev", f"{downside_dev:.1%}" if downside_dev else "N/A", "#ff9900"),
+            _kpi("Treynor", f"{ra.get('treynor', 0):.2f}" if ra.get('treynor', 0) else "N/A", "#00ff9d" if ra.get('treynor', 0) > 0 else "#ff3366"),
+        ], spacing=6))
+        col.controls.append(ft.Divider(height=1, color="#333333"))
+        col.controls.append(ft.Button("COMPUTE RADAR CHART", bgcolor="#00ff9d", color="#0a0a0a",
+                       style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=8)),
+                       on_click=_compute))
+        col.controls.append(radar_container)
+        return _card(col)
+
+    # portfolio_dna_tab, emotional_gauge_tab, time_machine_tab, trade_journal_tab, dream_architect_tab, stress_lab_tab removed
 
     def diversification_tab():
+        result_container = ft.Container(
+            content=ft.Text("Click 'Compute' to calculate diversification score", size=14, color="#aaaaaa"),
+            padding=10,
+        )
+        def _compute(e):
+            result_container.content = ft.Column([
+                ft.ProgressRing(width=30, height=30, stroke_width=3, color="#00ff9d"),
+                ft.Text("Computing...", size=12, color="#888888"),
+            ], horizontal_alignment=ft.CrossAxisAlignment.CENTER)
+            page.update()
+            try:
+                score = data.generate_diversification_score()
+                result_container.content = ft.Text(score, size=18, color="#ffffff", font_family="Consolas")
+            except Exception as ex:
+                result_container.content = ft.Text(f"Error: {ex}", size=14, color="#ff3366")
+            page.update()
         return _card(ft.Column([
             ft.Text("DIVERSIFICATION SCORE", size=22, weight=ft.FontWeight.BOLD, color="#00ff9d"),
-            ft.Text(data.generate_diversification_score(), size=18, color="#ffffff", font_family="Consolas"),
+            ft.Button("COMPUTE", bgcolor="#00ff9d", color="#0a0a0a",
+                       style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=8)),
+                       on_click=_compute),
+            result_container,
         ], spacing=15))
 
     def market_regime_tab():
-        return _card(ft.Column([
-            ft.Text("MARKET REGIME DETECTOR", size=22, weight=ft.FontWeight.BOLD, color="#00ff9d"),
-            ft.Text(data.detect_market_regime(), size=20, color="#ffffff"),
-        ], spacing=15))
+        regime = data.detect_market_regime()
+        s = data.portfolio_summary_stats()
+        rs = data.returns_series
+        def _kpi(label, value, color="#ffd700"):
+            return ft.Container(content=ft.Column([ft.Text(label, size=10, color="#aaaaaa"), ft.Text(str(value), size=16, weight=ft.FontWeight.BOLD, color=color)], spacing=2), bgcolor="#1a1a2e", padding=10, border_radius=10, expand=True)
+        # Compute regime indicators
+        vol_20 = float(rs.tail(20).std() * np.sqrt(252)) if len(rs) >= 20 else 0
+        vol_60 = float(rs.tail(60).std() * np.sqrt(252)) if len(rs) >= 60 else 0
+        vol_all = s.get("ann_volatility", 0)
+        mean_20 = float(rs.tail(20).mean() * 252) if len(rs) >= 20 else 0
+        mean_60 = float(rs.tail(60).mean() * 252) if len(rs) >= 60 else 0
+        # Trend detection
+        if not rs.empty:
+            cum = (1 + rs).cumprod()
+            sma_20 = float(cum.tail(20).mean()) if len(cum) >= 20 else 0
+            sma_50 = float(cum.tail(50).mean()) if len(cum) >= 50 else 0
+            sma_200 = float(cum.tail(200).mean()) if len(cum) >= 200 else 0
+            current = float(cum.iloc[-1]) if len(cum) > 0 else 0
+            above_20 = current > sma_20 if sma_20 > 0 else False
+            above_50 = current > sma_50 if sma_50 > 0 else False
+            above_200 = current > sma_200 if sma_200 > 0 else False
+            trend_score = sum([above_20, above_50, above_200])
+            trend_label = "STRONG UPTREND" if trend_score == 3 else "UPTREND" if trend_score == 2 else "NEUTRAL" if trend_score == 1 else "DOWNTREND"
+            trend_color = "#00ff9d" if trend_score >= 2 else "#ffd700" if trend_score == 1 else "#ff3366"
+        else:
+            trend_label = "N/A"
+            trend_color = "#888888"
+            above_20 = above_50 = above_200 = False
+            trend_score = 0
+        vol_regime = "HIGH VOL" if vol_20 > 0.25 else "NORMAL" if vol_20 > 0.12 else "LOW VOL"
+        vol_color = "#ff3366" if vol_20 > 0.25 else "#ffd700" if vol_20 > 0.12 else "#00ff9d"
+        momentum_20 = mean_20
+        momentum_color = "#00ff9d" if momentum_20 > 0 else "#ff3366"
+
+        col = ft.Column(scroll=ft.ScrollMode.AUTO, spacing=10)
+        col.controls.append(ft.Text("MARKET REGIME DETECTOR", size=22, weight=ft.FontWeight.BOLD, color="#00ff9d"))
+        col.controls.append(ft.Container(
+            content=ft.Text(regime, size=20, color="#ffffff", weight=ft.FontWeight.BOLD),
+            bgcolor="#1a1a2e", padding=15, border_radius=10,
+        ))
+        col.controls.append(ft.Divider(height=1, color="#333333"))
+        col.controls.append(ft.Text("TREND ANALYSIS", size=15, weight=ft.FontWeight.BOLD, color="#00bfff"))
+        col.controls.append(ft.Row([
+            _kpi("Trend", trend_label, trend_color),
+            _kpi("Above SMA-20", "YES" if above_20 else "NO", "#00ff9d" if above_20 else "#ff3366"),
+            _kpi("Above SMA-50", "YES" if above_50 else "NO", "#00ff9d" if above_50 else "#ff3366"),
+            _kpi("Above SMA-200", "YES" if above_200 else "NO", "#00ff9d" if above_200 else "#ff3366"),
+        ], spacing=6))
+        col.controls.append(ft.Divider(height=1, color="#333333"))
+        col.controls.append(ft.Text("VOLATILITY REGIME", size=15, weight=ft.FontWeight.BOLD, color="#ff9900"))
+        col.controls.append(ft.Row([
+            _kpi("Regime", vol_regime, vol_color),
+            _kpi("20-Day Vol", f"{vol_20:.1%}" if vol_20 else "N/A", vol_color),
+            _kpi("60-Day Vol", f"{vol_60:.1%}" if vol_60 else "N/A", "#ffd700"),
+            _kpi("All-Time Vol", f"{vol_all:.1%}" if vol_all else "N/A", "#aaaaaa"),
+        ], spacing=6))
+        col.controls.append(ft.Divider(height=1, color="#333333"))
+        col.controls.append(ft.Text("MOMENTUM", size=15, weight=ft.FontWeight.BOLD, color="#9966ff"))
+        col.controls.append(ft.Row([
+            _kpi("20-Day Annualized", f"{momentum_20:.1%}" if momentum_20 else "N/A", momentum_color),
+            _kpi("60-Day Annualized", f"{mean_60:.1%}" if mean_60 else "N/A", "#00ff9d" if mean_60 > 0 else "#ff3366"),
+            _kpi("Trend Score", f"{trend_score}/3", trend_color),
+            _kpi("Max Drawdown", f"{s.get('max_drawdown', 0):.1%}" if s.get('max_drawdown', 0) != 0 else "N/A", "#ff3366"),
+        ], spacing=6))
+        col.controls.append(ft.Text("Trend Score: 3=strong uptrend, 2=uptrend, 1=neutral, 0=downtrend (based on SMA crossovers)", size=10, color="#666666", italic=True))
+        return _card(col)
 
     # voice_tab, monte_carlo_tab, constellation_tab, settings_tab removed
 
@@ -1819,23 +2524,138 @@ def main(page: ft.Page):
     # ====================== NEW TAB BUILDERS ======================
     def drawdown_tab():
         dd = data.max_drawdown()
-        dd_text = f"Max Drawdown: {dd:.1%}" if dd != 0 else "Max Drawdown: N/A (no data)"
-        return _card(ft.Column([
-            ft.Text("DRAWDOWN ANALYSIS", size=22, weight=ft.FontWeight.BOLD, color="#ff3366"),
-            _chart_image(data.chart_drawdown()),
-            ft.Text(dd_text, size=16, color="#ff3366"),
-        ], scroll=ft.ScrollMode.AUTO, spacing=15))
+        rec = data.recovery_time()
+        s = data.portfolio_summary_stats()
+        rs = data.returns_series
+        def _kpi(label, value, color="#ffd700"):
+            return ft.Container(content=ft.Column([ft.Text(label, size=10, color="#aaaaaa"), ft.Text(str(value), size=16, weight=ft.FontWeight.BOLD, color=color)], spacing=2), bgcolor="#1a1a2e", padding=10, border_radius=10, expand=True)
+        # Compute drawdown series stats
+        dd_duration = 0
+        time_underwater_pct = 0
+        avg_dd = 0
+        if not rs.empty:
+            cum = (1 + rs).cumprod()
+            running_max = cum.cummax()
+            dd_series = (cum - running_max) / running_max
+            time_underwater_pct = (dd_series < -0.001).sum() / len(dd_series) * 100 if len(dd_series) > 0 else 0
+            avg_dd = float(dd_series[dd_series < 0].mean()) if (dd_series < 0).any() else 0
+            # Max DD duration in days
+            in_dd = dd_series < -0.001
+            if in_dd.any():
+                groups = (~in_dd).cumsum()
+                dd_lengths = in_dd.groupby(groups).sum()
+                dd_duration = int(dd_lengths.max()) if len(dd_lengths) > 0 else 0
+
+        col = ft.Column(scroll=ft.ScrollMode.AUTO, spacing=10)
+        col.controls.append(ft.Text("DRAWDOWN ANALYSIS", size=22, weight=ft.FontWeight.BOLD, color="#ff3366"))
+        col.controls.append(ft.Text("Complete drawdown history, duration, and recovery analysis", size=12, color="#aaaaaa"))
+        col.controls.append(ft.Row([
+            _kpi("Max Drawdown", f"{dd:.1%}" if dd != 0 else "N/A", "#ff3366"),
+            _kpi("Avg Drawdown", f"{avg_dd:.1%}" if avg_dd != 0 else "N/A", "#ff9900"),
+            _kpi("Max DD Duration", f"{dd_duration}d" if dd_duration > 0 else "N/A", "#ff3366"),
+            _kpi("Time Underwater", f"{time_underwater_pct:.1f}%", "#ff9900" if time_underwater_pct > 50 else "#ffd700"),
+        ], spacing=6))
+        col.controls.append(ft.Row([
+            _kpi("Max Recovery", f"{rec['max_recovery_days']}d" if rec['max_recovery_days'] > 0 else "N/A", "#ffd700"),
+            _kpi("Avg Recovery", f"{rec.get('avg_recovery_days', 0):.0f}d" if rec.get('avg_recovery_days', 0) > 0 else "N/A", "#ffd700"),
+            _kpi("In Drawdown?", "YES" if rec['currently_in_drawdown'] else "NO", "#ff3366" if rec['currently_in_drawdown'] else "#00ff9d"),
+            _kpi("Current DD Days", f"{rec['current_dd_days']}d" if rec['current_dd_days'] > 0 else "N/A", "#ff3366"),
+        ], spacing=6))
+        col.controls.append(ft.Row([
+            _kpi("Calmar Ratio", f"{s.get('calmar', 0):.2f}" if s.get('calmar', 0) != 0 else "N/A", "#00ff9d" if s.get('calmar', 0) > 0 else "#ff3366"),
+            _kpi("VaR 95%", f"{s.get('var_95', 0):.2%}" if s.get('var_95', 0) != 0 else "N/A", "#ff3366"),
+            _kpi("CVaR 95%", f"{s.get('cvar_95', 0):.2%}" if s.get('cvar_95', 0) != 0 else "N/A", "#ff3366"),
+            _kpi("Volatility", f"{s.get('ann_volatility', 0):.1%}" if s.get('ann_volatility', 0) != 0 else "N/A", "#ff9900"),
+        ], spacing=6))
+        col.controls.append(ft.Divider(height=1, color="#333333"))
+        # --- Drawdown chart with toggles ---
+        dd_opts = {'dollar': False, 'underwater': False, 'recovery': False}
+        dd_chart_c = ft.Container(content=_chart_image(data.chart_drawdown()))
+        def _dd_refresh():
+            dd_chart_c.content = _chart_image(data.chart_drawdown(
+                show_dollar=dd_opts['dollar'], show_underwater=dd_opts['underwater'],
+                show_recovery_bands=dd_opts['recovery']))
+            page.update()
+        def _dd_tog(key):
+            def handler(e):
+                dd_opts[key] = e.control.value
+                _dd_refresh()
+            return handler
+        dd_toggles = ft.Row([
+            ft.Switch(label="Dollar ($)", value=False, active_color="#ff3366",
+                      label_text_style=ft.TextStyle(size=11, color="#aaaaaa"), on_change=_dd_tog('dollar')),
+            ft.Switch(label="Underwater Shade", value=False, active_color="#ff9900",
+                      label_text_style=ft.TextStyle(size=11, color="#aaaaaa"), on_change=_dd_tog('underwater')),
+            ft.Switch(label="Recovery Bands", value=False, active_color="#ffd700",
+                      label_text_style=ft.TextStyle(size=11, color="#aaaaaa"), on_change=_dd_tog('recovery')),
+        ], spacing=8, scroll=ft.ScrollMode.AUTO)
+        col.controls.append(ft.Text("DRAWDOWN CHART", size=15, weight=ft.FontWeight.BOLD, color="#ff3366"))
+        col.controls.append(dd_toggles)
+        col.controls.append(dd_chart_c)
+        return _card(col)
 
     def holdings_bar_tab():
+        holdings_bar_state = {'mode': '$'}
+        bar_chart_container = ft.Container(
+            content=_chart_image(data.chart_holdings_bar(mode='$')),
+            padding=0,
+        )
+
+        def on_bar_mode_change(e):
+            holdings_bar_state['mode'] = e.control.value
+            bar_chart_container.content = _chart_image(data.chart_holdings_bar(mode=holdings_bar_state['mode']))
+            page.update()
+
+        bar_mode_dropdown = ft.Dropdown(
+            value="$", width=160,
+            options=[
+                ft.dropdown.Option("$", "Market Value ($)"),
+                ft.dropdown.Option("%", "Weight (%)"),
+                ft.dropdown.Option("gl", "Gain/Loss ($)"),
+                ft.dropdown.Option("gl%", "Gain/Loss (%)"),
+                ft.dropdown.Option("cb", "Cost Basis ($)"),
+            ],
+            on_select=on_bar_mode_change,
+            border_color="#ffd700", color="#ffffff", bgcolor="#1a1a2e",
+        )
+
         return _card(ft.Column([
             ft.Text("HOLDINGS BAR CHART", size=22, weight=ft.FontWeight.BOLD, color="#ffd700"),
-            _chart_image(data.chart_holdings_bar()),
+            ft.Text("All open positions", size=12, color="#aaaaaa"),
+            ft.Row([
+                ft.Text("Display:", size=12, color="#aaaaaa"),
+                bar_mode_dropdown,
+            ], spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            bar_chart_container,
         ], scroll=ft.ScrollMode.AUTO, spacing=15))
 
     def returns_dist_tab():
+        hist_opts = {'kde': False, 'cvar': False, 'normal': False, 'log': False}
+        hist_chart_c = ft.Container(content=_chart_image(data.chart_returns_histogram()))
+        def _hist_refresh():
+            hist_chart_c.content = _chart_image(data.chart_returns_histogram(
+                show_kde=hist_opts['kde'], show_cvar=hist_opts['cvar'],
+                show_normal=hist_opts['normal'], log_returns=hist_opts['log']))
+            page.update()
+        def _hist_tog(key):
+            def handler(e):
+                hist_opts[key] = e.control.value
+                _hist_refresh()
+            return handler
+        hist_toggles = ft.Row([
+            ft.Switch(label="KDE Curve", value=False, active_color="#00bfff",
+                      label_text_style=ft.TextStyle(size=11, color="#aaaaaa"), on_change=_hist_tog('kde')),
+            ft.Switch(label="CVaR Line", value=False, active_color="#ff9900",
+                      label_text_style=ft.TextStyle(size=11, color="#aaaaaa"), on_change=_hist_tog('cvar')),
+            ft.Switch(label="Normal Fit", value=False, active_color="#9966ff",
+                      label_text_style=ft.TextStyle(size=11, color="#aaaaaa"), on_change=_hist_tog('normal')),
+            ft.Switch(label="Log Returns", value=False, active_color="#ffd700",
+                      label_text_style=ft.TextStyle(size=11, color="#aaaaaa"), on_change=_hist_tog('log')),
+        ], spacing=8, scroll=ft.ScrollMode.AUTO)
         return _card(ft.Column([
             ft.Text("RETURNS DISTRIBUTION", size=22, weight=ft.FontWeight.BOLD, color="#00ff9d"),
-            _chart_image(data.chart_returns_histogram()),
+            hist_toggles,
+            hist_chart_c,
         ], scroll=ft.ScrollMode.AUTO, spacing=15))
 
     def sector_tab():
@@ -1847,45 +2667,238 @@ def main(page: ft.Page):
     # gain_loss_tab removed
 
     def rolling_sharpe_tab():
-        return _card(ft.Column([
-            ft.Text("ROLLING SHARPE RATIO", size=22, weight=ft.FontWeight.BOLD, color="#00ff9d"),
-            _chart_image(data.chart_rolling_sharpe()),
-        ], scroll=ft.ScrollMode.AUTO, spacing=15))
+        rs = data.returns_series
+        def _kpi(label, value, color="#ffd700"):
+            return ft.Container(content=ft.Column([ft.Text(label, size=10, color="#aaaaaa"), ft.Text(str(value), size=16, weight=ft.FontWeight.BOLD, color=color)], spacing=2), bgcolor="#1a1a2e", padding=10, border_radius=10, expand=True)
+        # Compute rolling sharpe stats
+        current_sharpe = 0
+        avg_sharpe = 0
+        min_sharpe = 0
+        max_sharpe = 0
+        pct_above_1 = 0
+        if len(rs) >= 60:
+            rolling_s = rs.rolling(60).mean() / rs.rolling(60).std() * np.sqrt(252)
+            rolling_s = rolling_s.dropna()
+            if len(rolling_s) > 0:
+                current_sharpe = float(rolling_s.iloc[-1])
+                avg_sharpe = float(rolling_s.mean())
+                min_sharpe = float(rolling_s.min())
+                max_sharpe = float(rolling_s.max())
+                pct_above_1 = float((rolling_s > 1).sum() / len(rolling_s) * 100)
+        col = ft.Column(scroll=ft.ScrollMode.AUTO, spacing=10)
+        col.controls.append(ft.Text("ROLLING SHARPE RATIO", size=22, weight=ft.FontWeight.BOLD, color="#00ff9d"))
+        col.controls.append(ft.Text("60-day rolling window annualized Sharpe ratio", size=12, color="#aaaaaa"))
+        col.controls.append(ft.Row([
+            _kpi("Current", f"{current_sharpe:.2f}" if current_sharpe else "N/A", "#00ff9d" if current_sharpe > 1 else "#ffd700" if current_sharpe > 0 else "#ff3366"),
+            _kpi("Average", f"{avg_sharpe:.2f}" if avg_sharpe else "N/A", "#00ff9d" if avg_sharpe > 0 else "#ff3366"),
+            _kpi("Min", f"{min_sharpe:.2f}" if min_sharpe else "N/A", "#ff3366"),
+            _kpi("Max", f"{max_sharpe:.2f}" if max_sharpe else "N/A", "#00ff9d"),
+            _kpi("% Above 1.0", f"{pct_above_1:.1f}%", "#00ff9d" if pct_above_1 > 50 else "#ffd700"),
+        ], spacing=6))
+        # --- Rolling Sharpe chart with toggles ---
+        rs_opts = {'window': 60, 'sortino': False, 'avg': False}
+        rs_chart_c = ft.Container(content=_chart_image(data.chart_rolling_sharpe()))
+        def _rs_refresh():
+            rs_chart_c.content = _chart_image(data.chart_rolling_sharpe(
+                window=rs_opts['window'], show_sortino=rs_opts['sortino'], show_avg=rs_opts['avg']))
+            page.update()
+        def _rs_tog(key):
+            def handler(e):
+                rs_opts[key] = e.control.value
+                _rs_refresh()
+            return handler
+        def _rs_win(e):
+            try:
+                rs_opts['window'] = int(e.control.value)
+            except Exception:
+                rs_opts['window'] = 60
+            _rs_refresh()
+        rs_toggles = ft.Row([
+            ft.Text("Window:", size=11, color="#aaaaaa"),
+            ft.Dropdown(value="60", width=90, options=[
+                ft.dropdown.Option("30", "30d"), ft.dropdown.Option("60", "60d"),
+                ft.dropdown.Option("90", "90d"), ft.dropdown.Option("120", "120d"),
+            ], on_select=_rs_win, border_color="#00ff9d", color="#ffffff", bgcolor="#1a1a2e"),
+            ft.Switch(label="Sortino Overlay", value=False, active_color="#ff9900",
+                      label_text_style=ft.TextStyle(size=11, color="#aaaaaa"), on_change=_rs_tog('sortino')),
+            ft.Switch(label="Show Average", value=False, active_color="#00bfff",
+                      label_text_style=ft.TextStyle(size=11, color="#aaaaaa"), on_change=_rs_tog('avg')),
+        ], spacing=8, scroll=ft.ScrollMode.AUTO)
+        col.controls.append(rs_toggles)
+        col.controls.append(rs_chart_c)
+        return _card(col)
 
     def rolling_vol_tab():
-        return _card(ft.Column([
-            ft.Text("ROLLING VOLATILITY", size=22, weight=ft.FontWeight.BOLD, color="#ff9900"),
-            _chart_image(data.chart_rolling_volatility()),
-        ], scroll=ft.ScrollMode.AUTO, spacing=15))
+        rs = data.returns_series
+        def _kpi(label, value, color="#ffd700"):
+            return ft.Container(content=ft.Column([ft.Text(label, size=10, color="#aaaaaa"), ft.Text(str(value), size=16, weight=ft.FontWeight.BOLD, color=color)], spacing=2), bgcolor="#1a1a2e", padding=10, border_radius=10, expand=True)
+        current_vol = 0
+        avg_vol = 0
+        min_vol = 0
+        max_vol = 0
+        vol_regime = "N/A"
+        if len(rs) >= 30:
+            rolling_v = rs.rolling(30).std() * np.sqrt(252)
+            rolling_v = rolling_v.dropna()
+            if len(rolling_v) > 0:
+                current_vol = float(rolling_v.iloc[-1])
+                avg_vol = float(rolling_v.mean())
+                min_vol = float(rolling_v.min())
+                max_vol = float(rolling_v.max())
+                vol_regime = "HIGH" if current_vol > avg_vol * 1.5 else "ELEVATED" if current_vol > avg_vol else "NORMAL" if current_vol > avg_vol * 0.5 else "LOW"
+        vol_color = "#ff3366" if vol_regime == "HIGH" else "#ff9900" if vol_regime == "ELEVATED" else "#ffd700" if vol_regime == "NORMAL" else "#00ff9d"
+        col = ft.Column(scroll=ft.ScrollMode.AUTO, spacing=10)
+        col.controls.append(ft.Text("ROLLING VOLATILITY", size=22, weight=ft.FontWeight.BOLD, color="#ff9900"))
+        col.controls.append(ft.Text("30-day rolling window annualized volatility", size=12, color="#aaaaaa"))
+        col.controls.append(ft.Row([
+            _kpi("Current", f"{current_vol:.1%}" if current_vol else "N/A", vol_color),
+            _kpi("Average", f"{avg_vol:.1%}" if avg_vol else "N/A", "#ffd700"),
+            _kpi("Min", f"{min_vol:.1%}" if min_vol else "N/A", "#00ff9d"),
+            _kpi("Max", f"{max_vol:.1%}" if max_vol else "N/A", "#ff3366"),
+            _kpi("Regime", vol_regime, vol_color),
+        ], spacing=6))
+        # --- Rolling Vol chart with toggles ---
+        rv_opts = {'window': 30, 'bands': False, 'regime': False}
+        rv_chart_c = ft.Container(content=_chart_image(data.chart_rolling_volatility()))
+        def _rv_refresh():
+            rv_chart_c.content = _chart_image(data.chart_rolling_volatility(
+                window=rv_opts['window'], show_bands=rv_opts['bands'], show_regime=rv_opts['regime']))
+            page.update()
+        def _rv_tog(key):
+            def handler(e):
+                rv_opts[key] = e.control.value
+                _rv_refresh()
+            return handler
+        def _rv_win(e):
+            try:
+                rv_opts['window'] = int(e.control.value)
+            except Exception:
+                rv_opts['window'] = 30
+            _rv_refresh()
+        rv_toggles = ft.Row([
+            ft.Text("Window:", size=11, color="#aaaaaa"),
+            ft.Dropdown(value="30", width=90, options=[
+                ft.dropdown.Option("20", "20d"), ft.dropdown.Option("30", "30d"),
+                ft.dropdown.Option("60", "60d"), ft.dropdown.Option("90", "90d"),
+            ], on_select=_rv_win, border_color="#ff9900", color="#ffffff", bgcolor="#1a1a2e"),
+            ft.Switch(label="±1σ Bands", value=False, active_color="#ffd700",
+                      label_text_style=ft.TextStyle(size=11, color="#aaaaaa"), on_change=_rv_tog('bands')),
+            ft.Switch(label="Regime Shade", value=False, active_color="#ff3366",
+                      label_text_style=ft.TextStyle(size=11, color="#aaaaaa"), on_change=_rv_tog('regime')),
+        ], spacing=8, scroll=ft.ScrollMode.AUTO)
+        col.controls.append(rv_toggles)
+        col.controls.append(rv_chart_c)
+        return _card(col)
 
     def monthly_heatmap_tab():
+        hm_container = ft.Container(
+            content=ft.Text("Click 'Compute' to generate monthly heatmap", size=14, color="#aaaaaa"),
+            padding=10,
+        )
+        def _compute(e):
+            hm_container.content = ft.Column([
+                ft.ProgressRing(width=30, height=30, stroke_width=3, color="#ffd700"),
+                ft.Text("Generating heatmap...", size=12, color="#888888"),
+            ], horizontal_alignment=ft.CrossAxisAlignment.CENTER)
+            page.update()
+            try:
+                hm_container.content = _chart_image(data.chart_monthly_heatmap())
+            except Exception as ex:
+                hm_container.content = ft.Text(f"Error: {ex}", size=14, color="#ff3366")
+            page.update()
         return _card(ft.Column([
             ft.Text("MONTHLY RETURNS HEATMAP", size=22, weight=ft.FontWeight.BOLD, color="#ffd700"),
-            _chart_image(data.chart_monthly_heatmap()),
+            ft.Button("COMPUTE", bgcolor="#ffd700", color="#0a0a0a",
+                       style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=8)),
+                       on_click=_compute),
+            hm_container,
         ], scroll=ft.ScrollMode.AUTO, spacing=15))
 
     # weight_pie_tab, growth_projection_tab, efficient_frontier_tab removed
 
     def summary_stats_tab():
-        s = data.portfolio_summary_stats()
-        def _kpi(label, value, color="#ffd700"):
-            return ft.Container(
-                content=ft.Column([ft.Text(label, size=10, color="#aaaaaa"), ft.Text(str(value), size=16, weight=ft.FontWeight.BOLD, color=color)], spacing=2),
-                bgcolor="#1a1a2e", padding=10, border_radius=10, expand=True,
-            )
-        def _v(val, fmt=".2f", pct=False, dollar=False):
-            if val == 0: return "N/A"
-            if dollar: return f"${val:,.0f}"
-            if pct: return f"{val:{fmt}}"
-            return f"{val:{fmt}}"
-        gl = s['total_gain_loss']
-        gl_c = "#00ff9d" if gl >= 0 else "#ff3366"
+        stats_container = ft.Container(
+            content=ft.Text("Click 'Compute' to load summary statistics", size=14, color="#aaaaaa"),
+            padding=10,
+        )
+        def _compute(e):
+            stats_container.content = ft.Column([
+                ft.ProgressRing(width=30, height=30, stroke_width=3, color="#00ff9d"),
+                ft.Text("Computing summary stats...", size=12, color="#888888"),
+            ], horizontal_alignment=ft.CrossAxisAlignment.CENTER)
+            page.update()
+            try:
+                s = data.portfolio_summary_stats()
+                ra = data.risk_adjusted_returns()
+                pf_val = data.profit_factor()
+                wl = data.win_loss_streaks()
+                rec = data.recovery_time()
+                rs = data.returns_series
+                def _kpi(label, value, color="#ffd700"):
+                    return ft.Container(
+                        content=ft.Column([ft.Text(label, size=10, color="#aaaaaa"), ft.Text(str(value), size=16, weight=ft.FontWeight.BOLD, color=color)], spacing=2),
+                        bgcolor="#1a1a2e", padding=10, border_radius=10, expand=True,
+                    )
+                def _kpi_sm(label, value, color="#ffd700"):
+                    return ft.Container(
+                        content=ft.Column([ft.Text(label, size=9, color="#aaaaaa"), ft.Text(str(value), size=13, weight=ft.FontWeight.BOLD, color=color)], spacing=1),
+                        bgcolor="#1a1a2e", padding=6, border_radius=8, expand=True,
+                    )
+                def _v(val, fmt=".2f"):
+                    if val == 0: return "N/A"
+                    return f"{val:{fmt}}"
+                gl = s['total_gain_loss']
+                gl_c = "#00ff9d" if gl >= 0 else "#ff3366"
+                # Extra computed stats
+                avg_win = float(rs[rs > 0].mean()) if not rs.empty and (rs > 0).any() else 0
+                avg_loss = float(rs[rs < 0].mean()) if not rs.empty and (rs < 0).any() else 0
+                payoff = abs(avg_win / avg_loss) if avg_loss != 0 else 0
+                tail_ratio_val = 0
+                if not rs.empty and len(rs) > 10:
+                    p95 = float(np.percentile(rs, 95))
+                    p5 = float(np.percentile(rs, 5))
+                    tail_ratio_val = abs(p95 / p5) if p5 != 0 else 0
+                downside_dev = float(rs[rs < 0].std() * np.sqrt(252)) if not rs.empty and (rs < 0).any() else 0
+
+                stats_container.content = ft.Column([
+                    ft.Text("PORTFOLIO VALUE", size=14, weight=ft.FontWeight.BOLD, color="#ffd700"),
+                    ft.Row([_kpi("Total Value", f"${s['total_value']:,.0f}"), _kpi("Cost Basis", f"${s.get('total_cost_basis', 0):,.0f}" if s.get('total_cost_basis') else "N/A", "#aaaaaa"), _kpi("Total G/L", f"${gl:,.0f}" if gl != 0 else "N/A", gl_c), _kpi("G/L %", f"{s.get('total_gain_pct', 0):+.1f}%" if s.get('total_gain_pct') else "N/A", gl_c), _kpi("Holdings", str(s['num_holdings']) if s['num_holdings'] > 0 else "0")], spacing=6),
+                    ft.Divider(height=1, color="#222222"),
+                    ft.Text("RETURN & RISK", size=14, weight=ft.FontWeight.BOLD, color="#00ff9d"),
+                    ft.Row([_kpi("Ann. Return", f"{s['ann_return']:.1%}" if s['ann_return'] != 0 else "N/A", "#00ff9d"), _kpi("Ann. Vol", f"{s['ann_volatility']:.1%}" if s['ann_volatility'] != 0 else "N/A", "#ff3366"), _kpi("Max DD", f"{s['max_drawdown']:.1%}" if s['max_drawdown'] != 0 else "N/A", "#ff3366"), _kpi("Downside Dev", f"{downside_dev:.1%}" if downside_dev else "N/A", "#ff9900")], spacing=6),
+                    ft.Divider(height=1, color="#222222"),
+                    ft.Text("RISK-ADJUSTED RATIOS", size=14, weight=ft.FontWeight.BOLD, color="#00bfff"),
+                    ft.Row([_kpi("Sharpe", _v(s['sharpe'])), _kpi("Sortino", _v(s['sortino'])), _kpi("Calmar", _v(s['calmar'])), _kpi("Treynor", _v(ra.get('treynor', 0)))], spacing=6),
+                    ft.Divider(height=1, color="#222222"),
+                    ft.Text("TAIL RISK", size=14, weight=ft.FontWeight.BOLD, color="#ff3366"),
+                    ft.Row([_kpi("VaR 95%", f"{s['var_95']:.2%}" if s['var_95'] != 0 else "N/A", "#ff3366"), _kpi("CVaR 95%", f"{s['cvar_95']:.2%}" if s['cvar_95'] != 0 else "N/A", "#ff3366"), _kpi("Tail Ratio", f"{tail_ratio_val:.2f}" if tail_ratio_val else "N/A", "#00ff9d" if tail_ratio_val > 1 else "#ff3366"), _kpi("Skewness", _v(s['skewness'], ".3f"), "#00ff9d" if s['skewness'] > 0 else "#ff3366")], spacing=6),
+                    ft.Divider(height=1, color="#222222"),
+                    ft.Text("TRADING PERFORMANCE", size=14, weight=ft.FontWeight.BOLD, color="#9966ff"),
+                    ft.Row([_kpi("Win Rate", f"{s['win_rate']:.0%}" if s['win_rate'] != 0 else "N/A", "#00ff9d"), _kpi("Profit Factor", f"{pf_val:.2f}" if pf_val else "N/A", "#00ff9d" if pf_val > 1 else "#ff3366"), _kpi("Payoff Ratio", f"{payoff:.2f}" if payoff else "N/A", "#00ff9d" if payoff > 1 else "#ff3366"), _kpi("Avg Win", f"{avg_win:.2%}" if avg_win else "N/A", "#00ff9d")], spacing=6),
+                    ft.Row([_kpi("Avg Loss", f"{avg_loss:.2%}" if avg_loss else "N/A", "#ff3366"), _kpi("Best Day", f"{s['best_day']:.2%}" if s['best_day'] != 0 else "N/A", "#00ff9d"), _kpi("Worst Day", f"{s['worst_day']:.2%}" if s['worst_day'] != 0 else "N/A", "#ff3366"), _kpi("Kurtosis", _v(s['kurtosis'], ".3f"), "#ffd700")], spacing=6),
+                    ft.Divider(height=1, color="#222222"),
+                    ft.Text("CAPM & MARKET", size=14, weight=ft.FontWeight.BOLD, color="#ffd700"),
+                    ft.Row([_kpi("Beta (SPY)", _v(ra.get('beta', 0)), "#ffd700"), _kpi("Alpha", f"{ra.get('alpha', 0):.2%}" if ra.get('alpha') else "N/A", "#00ff9d" if ra.get('alpha', 0) > 0 else "#ff3366"), _kpi("Info Ratio", _v(ra.get('info_ratio', 0)), "#00ff9d" if ra.get('info_ratio', 0) > 0 else "#ff3366"), _kpi("Win Streak", f"{wl['longest_win']}d" if wl['longest_win'] > 0 else "N/A", "#00ff9d")], spacing=6),
+                    ft.Divider(height=1, color="#222222"),
+                    ft.Text("RECOVERY & STREAKS", size=14, weight=ft.FontWeight.BOLD, color="#ff9900"),
+                    ft.Row([
+                        _kpi_sm("Max Recovery", f"{rec['max_recovery_days']}d" if rec['max_recovery_days'] > 0 else "N/A"),
+                        _kpi_sm("Pos Days", str(s.get('positive_days', 0)) if s.get('positive_days') else "N/A", "#00ff9d"),
+                        _kpi_sm("Neg Days", str(s.get('negative_days', 0)) if s.get('negative_days') else "N/A", "#ff3366"),
+                        _kpi_sm("Loss Streak", f"{wl['longest_loss']}d" if wl['longest_loss'] > 0 else "N/A", "#ff3366"),
+                        _kpi_sm("In DD?", "YES" if rec['currently_in_drawdown'] else "NO", "#ff3366" if rec['currently_in_drawdown'] else "#00ff9d"),
+                    ], spacing=4),
+                ], spacing=6)
+            except Exception as ex:
+                stats_container.content = ft.Text(f"Error: {ex}", size=14, color="#ff3366")
+            page.update()
         return _card(ft.Column([
             ft.Text("PORTFOLIO SUMMARY STATS", size=22, weight=ft.FontWeight.BOLD, color="#00ff9d"),
-            ft.Row([_kpi("Total Value", f"${s['total_value']:,.0f}"), _kpi("Holdings", str(s['num_holdings']) if s['num_holdings'] > 0 else "0"), _kpi("Ann. Return", f"{s['ann_return']:.1%}" if s['ann_return'] != 0 else "N/A", "#00ff9d"), _kpi("Ann. Vol", f"{s['ann_volatility']:.1%}" if s['ann_volatility'] != 0 else "N/A", "#ff3366")], spacing=6),
-            ft.Row([_kpi("Sharpe", _v(s['sharpe'])), _kpi("Sortino", _v(s['sortino'])), _kpi("Calmar", _v(s['calmar'])), _kpi("Max DD", f"{s['max_drawdown']:.1%}" if s['max_drawdown'] != 0 else "N/A", "#ff3366")], spacing=6),
-            ft.Row([_kpi("VaR 95%", f"{s['var_95']:.2%}" if s['var_95'] != 0 else "N/A", "#ff3366"), _kpi("CVaR 95%", f"{s['cvar_95']:.2%}" if s['cvar_95'] != 0 else "N/A", "#ff3366"), _kpi("Win Rate", f"{s['win_rate']:.0%}" if s['win_rate'] != 0 else "N/A", "#00ff9d"), _kpi("Best Day", f"{s['best_day']:.2%}" if s['best_day'] != 0 else "N/A", "#00ff9d")], spacing=6),
-            ft.Row([_kpi("Worst Day", f"{s['worst_day']:.2%}" if s['worst_day'] != 0 else "N/A", "#ff3366"), _kpi("Skewness", _v(s['skewness'])), _kpi("Kurtosis", _v(s['kurtosis'])), _kpi("Total G/L", f"${gl:,.0f}" if gl != 0 else "N/A", gl_c)], spacing=6),
+            ft.Text("Complete statistical overview — click Compute to load all metrics", size=12, color="#aaaaaa"),
+            ft.Button("COMPUTE", bgcolor="#00ff9d", color="#0a0a0a",
+                       style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=8)),
+                       on_click=_compute),
+            stats_container,
         ], scroll=ft.ScrollMode.AUTO, spacing=8))
 
     def top_movers_tab():
@@ -1964,13 +2977,36 @@ def main(page: ft.Page):
             'IWM': '#00bfff', 'BTC-USD': '#ff9900', 'DIA': '#9966ff',
             'VTI': '#66ff66', 'GLD': '#cccc00', 'TLT': '#ff6699',
         }
-        # Default: Portfolio + all benchmarks ON
-        active_lines = {'Portfolio': True}
+        # Default: all OFF (none selected)
+        active_lines = {'Portfolio': False}
         for bm_sym in all_benchmarks:
-            active_lines[bm_sym] = True
+            active_lines[bm_sym] = False
         for sym in user_syms:
             if sym not in active_lines:
                 active_lines[sym] = False
+
+        def _kpi(label, value, color="#ffd700"):
+            return ft.Container(content=ft.Column([ft.Text(label, size=9, color="#aaaaaa"), ft.Text(value, size=14, weight=ft.FontWeight.BOLD, color=color)], spacing=1), bgcolor="#1a1a2e", padding=8, border_radius=8, expand=True)
+
+        # Build relative performance KPIs
+        relative_kpis = []
+        port_stats = data.portfolio_summary_stats()
+        port_ann_ret = port_stats.get('ann_return', 0) if port_stats else 0
+        port_ann_vol = port_stats.get('ann_vol', 0) if port_stats else 0
+        if bm and port_ann_ret != 0:
+            relative_kpis.append(ft.Text("RELATIVE PERFORMANCE", size=14, weight=ft.FontWeight.BOLD, color="#9966ff"))
+            rel_row = []
+            for b in bm:
+                bm_ret = b.get('ann_return', 0)
+                excess = port_ann_ret - bm_ret if bm_ret else 0
+                rel_row.append(_kpi(f"vs {b['symbol']}", f"{excess:+.1%}" if excess else "N/A", "#00ff9d" if excess > 0 else "#ff3366"))
+            relative_kpis.append(ft.Row(rel_row, spacing=4))
+            # Portfolio's own stats
+            relative_kpis.append(ft.Row([
+                _kpi("Portfolio Ann. Ret", f"{port_ann_ret:.1%}" if port_ann_ret else "N/A", "#00ff9d" if port_ann_ret > 0 else "#ff3366"),
+                _kpi("Portfolio Ann. Vol", f"{port_ann_vol:.1%}" if port_ann_vol else "N/A", "#ff9900"),
+            ], spacing=4))
+            relative_kpis.append(ft.Divider(height=1, color="#333333"))
 
         # Build benchmark table
         if not bm:
@@ -2005,11 +3041,14 @@ def main(page: ft.Page):
         # Time range state
         current_timerange = {'value': 'ALL'}
 
-        # Chart container that will be updated on toggle
+        # Chart container that will be updated on toggle - start empty since none selected
         chart_container = ft.Container(
-            content=_chart_image(data.chart_benchmark_overlay(benchmarks=all_benchmarks, timerange='ALL')),
+            content=ft.Text("Select benchmarks to compare", color="#aaaaaa", size=14),
             padding=0,
         )
+
+        # Correlation & spread overlay state
+        bm_chart_opts = {'corr_labels': False, 'spread': False}
 
         def _rebuild_chart():
             selected = [s for s, on in active_lines.items() if on and s != 'Portfolio']
@@ -2020,7 +3059,9 @@ def main(page: ft.Page):
             else:
                 chart_container.content = _chart_image(
                     data.chart_benchmark_overlay(benchmarks=selected if selected else None,
-                                                  show_portfolio=show_portfolio, timerange=tr)
+                                                  show_portfolio=show_portfolio, timerange=tr,
+                                                  show_corr_labels=bm_chart_opts['corr_labels'],
+                                                  show_spread=bm_chart_opts['spread'])
                 )
             page.update()
 
@@ -2071,7 +3112,7 @@ def main(page: ft.Page):
                     ft.Container(width=12, height=12, bgcolor=line_colors.get('Portfolio', '#00ff9d'),
                                  border_radius=6),
                     ft.Text("Portfolio", color="#ffffff", size=12, weight=ft.FontWeight.BOLD),
-                    ft.Switch(value=active_lines.get('Portfolio', True),
+                    ft.Switch(value=False,
                               active_color="#00ff9d", on_change=_on_toggle('Portfolio')),
                 ], spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                 padding=ft.Padding(right=12),
@@ -2085,7 +3126,7 @@ def main(page: ft.Page):
                     content=ft.Row([
                         ft.Container(width=12, height=12, bgcolor=c, border_radius=6),
                         ft.Text(sym, color="#ffffff", size=12, weight=ft.FontWeight.BOLD),
-                        ft.Switch(value=active_lines.get(sym, True),
+                        ft.Switch(value=False,
                                   active_color=c, on_change=_on_toggle(sym)),
                     ], spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                     padding=ft.Padding(right=12),
@@ -2112,35 +3153,96 @@ def main(page: ft.Page):
             wrap=True, spacing=4, run_spacing=4,
         )
 
-        return _card(ft.Column([
-            ft.Text("BENCHMARK COMPARISON", size=22, weight=ft.FontWeight.BOLD, color="#ffd700"),
-            table_content,
-            ft.Container(
-                content=ft.Column([
-                    ft.Text("Toggle Lines:", size=13, color="#aaaaaa", weight=ft.FontWeight.BOLD),
-                    toggle_row,
-                    ft.Divider(height=1, color="#333333"),
-                    ft.Text("Time Range:", size=13, color="#aaaaaa", weight=ft.FontWeight.BOLD),
-                    timerange_row,
-                ], spacing=6),
-                bgcolor="#1a1a2e", border_radius=8, padding=10, margin=ft.Margin(top=8, bottom=4),
-            ),
-            chart_container,
-        ], scroll=ft.ScrollMode.AUTO, spacing=15))
+        # Correlation / spread overlay toggles
+        def _bm_opt_tog(key):
+            def handler(e):
+                bm_chart_opts[key] = e.control.value
+                _rebuild_chart()
+            return handler
+        overlay_toggles = ft.Row([
+            ft.Switch(label="Correlation Labels (ρ)", value=False, active_color="#9966ff",
+                      label_text_style=ft.TextStyle(size=11, color="#aaaaaa"), on_change=_bm_opt_tog('corr_labels')),
+            ft.Switch(label="Spread Shading", value=False, active_color="#00bfff",
+                      label_text_style=ft.TextStyle(size=11, color="#aaaaaa"), on_change=_bm_opt_tog('spread')),
+        ], spacing=8)
+
+        col = ft.Column(scroll=ft.ScrollMode.AUTO, spacing=10)
+        col.controls.append(ft.Text("BENCHMARK COMPARISON", size=22, weight=ft.FontWeight.BOLD, color="#ffd700"))
+        col.controls.append(ft.Text("Compare portfolio performance against major benchmarks", size=12, color="#aaaaaa"))
+        for kpi in relative_kpis:
+            col.controls.append(kpi)
+        col.controls.append(table_content)
+        col.controls.append(ft.Container(
+            content=ft.Column([
+                ft.Text("Toggle Lines:", size=13, color="#aaaaaa", weight=ft.FontWeight.BOLD),
+                toggle_row,
+                ft.Divider(height=1, color="#333333"),
+                ft.Text("Time Range:", size=13, color="#aaaaaa", weight=ft.FontWeight.BOLD),
+                timerange_row,
+                ft.Divider(height=1, color="#333333"),
+                ft.Text("Chart Overlays:", size=13, color="#aaaaaa", weight=ft.FontWeight.BOLD),
+                overlay_toggles,
+            ], spacing=6),
+            bgcolor="#1a1a2e", border_radius=8, padding=10, margin=ft.Margin(top=8, bottom=4),
+        ))
+        col.controls.append(chart_container)
+        return _card(col)
 
     def trade_log_tab():
         trades = data.get_trade_log(80)
+        def _kpi(label, value, color="#ffd700"):
+            return ft.Container(content=ft.Column([ft.Text(label, size=9, color="#aaaaaa"), ft.Text(value, size=14, weight=ft.FontWeight.BOLD, color=color)], spacing=1), bgcolor="#1a1a2e", padding=8, border_radius=8, expand=True)
         if not trades:
             content = ft.Text("No trade data loaded. Import data first.", size=16, color="#aaaaaa")
+            summary_kpis = []
         else:
+            # Compute trade summary stats
+            total_trades = len(trades)
+            total_gl = sum(t['gain_loss'] for t in trades)
+            winners = [t for t in trades if t['gain_loss'] >= 0]
+            losers = [t for t in trades if t['gain_loss'] < 0]
+            n_win = len(winners)
+            n_lose = len(losers)
+            win_rate = n_win / total_trades * 100 if total_trades else 0
+            avg_gl = total_gl / total_trades if total_trades else 0
+            avg_win = sum(t['gain_loss'] for t in winners) / n_win if n_win else 0
+            avg_loss = sum(t['gain_loss'] for t in losers) / n_lose if n_lose else 0
+            biggest_win = max((t['gain_loss'] for t in trades), default=0)
+            biggest_loss = min((t['gain_loss'] for t in trades), default=0)
+            unique_syms = len(set(t['symbol'] for t in trades))
+            total_value = sum(t['quantity'] * t['price'] for t in trades)
+            summary_kpis = [
+                ft.Text("TRADE SUMMARY", size=14, weight=ft.FontWeight.BOLD, color="#00bfff"),
+                ft.Row([
+                    _kpi("Total Trades", str(total_trades), "#00bfff"),
+                    _kpi("Net G/L", f"${total_gl:,.0f}", "#00ff9d" if total_gl >= 0 else "#ff3366"),
+                    _kpi("Win Rate", f"{win_rate:.1f}%", "#00ff9d" if win_rate >= 50 else "#ff3366"),
+                    _kpi("Winners", str(n_win), "#00ff9d"),
+                    _kpi("Losers", str(n_lose), "#ff3366"),
+                ], spacing=4),
+                ft.Row([
+                    _kpi("Avg G/L", f"${avg_gl:,.0f}", "#00ff9d" if avg_gl >= 0 else "#ff3366"),
+                    _kpi("Avg Win", f"${avg_win:,.0f}", "#00ff9d"),
+                    _kpi("Avg Loss", f"${avg_loss:,.0f}", "#ff3366"),
+                    _kpi("Best Trade", f"${biggest_win:,.0f}", "#00ff9d"),
+                    _kpi("Worst Trade", f"${biggest_loss:,.0f}", "#ff3366"),
+                ], spacing=4),
+                ft.Row([
+                    _kpi("Unique Symbols", str(unique_syms), "#9966ff"),
+                    _kpi("Total Value", f"${total_value:,.0f}", "#ffd700"),
+                ], spacing=4),
+                ft.Divider(height=1, color="#333333"),
+            ]
             rows = []
             for t in trades[:50]:
                 gl_c = "#00ff9d" if t['gain_loss'] >= 0 else "#ff3366"
+                trade_value = t['quantity'] * t['price']
                 rows.append(ft.DataRow(cells=[
                     ft.DataCell(ft.Text(t['date'], color="#aaaaaa")),
                     ft.DataCell(ft.Text(t['symbol'], color="#ffffff", weight=ft.FontWeight.BOLD)),
                     ft.DataCell(ft.Text(f"{t['quantity']:.2f}", color="#ffffff")),
                     ft.DataCell(ft.Text(f"${t['price']:,.2f}", color="#ffd700")),
+                    ft.DataCell(ft.Text(f"${trade_value:,.0f}", color="#00bfff")),
                     ft.DataCell(ft.Text(f"${t['cost_basis']:,.0f}", color="#aaaaaa")),
                     ft.DataCell(ft.Text(f"${t['gain_loss']:,.0f}", color=gl_c)),
                 ]))
@@ -2150,16 +3252,19 @@ def main(page: ft.Page):
                     ft.DataColumn(ft.Text("Symbol", color="#00ff9d")),
                     ft.DataColumn(ft.Text("Qty", color="#00ff9d")),
                     ft.DataColumn(ft.Text("Price", color="#00ff9d")),
+                    ft.DataColumn(ft.Text("Value", color="#00ff9d")),
                     ft.DataColumn(ft.Text("Cost Basis", color="#00ff9d")),
                     ft.DataColumn(ft.Text("G/L", color="#00ff9d")),
                 ],
                 rows=rows, heading_row_color="#1a1a2e",
             )
-        return _card(ft.Column([
-            ft.Text("TRADE LOG", size=22, weight=ft.FontWeight.BOLD, color="#00ff9d"),
-            ft.Text(f"Showing latest {min(50, len(trades))} records", size=12, color="#aaaaaa"),
-            content,
-        ], scroll=ft.ScrollMode.AUTO, spacing=15))
+        col = ft.Column(scroll=ft.ScrollMode.AUTO, spacing=10)
+        col.controls.append(ft.Text("TRADE LOG", size=22, weight=ft.FontWeight.BOLD, color="#00ff9d"))
+        col.controls.append(ft.Text(f"Showing latest {min(50, len(trades))} of {len(trades)} records", size=12, color="#aaaaaa"))
+        for kpi in summary_kpis:
+            col.controls.append(kpi)
+        col.controls.append(content)
+        return _card(col)
 
     # income_tracker_tab removed
 
@@ -2169,10 +3274,35 @@ def main(page: ft.Page):
 
     def correlation_dive_tab():
         cd = data.correlation_deep_dive()
+        corr_mat = data.correlation_matrix()
         def _kpi(label, value, color="#ffd700"):
             return ft.Container(content=ft.Column([ft.Text(label, size=10, color="#aaaaaa"), ft.Text(value, size=16, weight=ft.FontWeight.BOLD, color=color)], spacing=2), bgcolor="#1a1a2e", padding=10, border_radius=10, expand=True)
+        def _kpi_sm(label, value, color="#ffd700"):
+            return ft.Container(content=ft.Column([ft.Text(label, size=9, color="#aaaaaa"), ft.Text(value, size=13, weight=ft.FontWeight.BOLD, color=color)], spacing=1), bgcolor="#1a1a2e", padding=6, border_radius=8, expand=True)
         most = cd['most_correlated']
         least = cd['least_correlated']
+        # Extra correlation stats
+        n_pairs = len(cd['pairs'])
+        high_corr_pairs = sum(1 for p in cd['pairs'] if abs(p['corr']) > 0.7)
+        neg_corr_pairs = sum(1 for p in cd['pairs'] if p['corr'] < 0)
+        moderate_pairs = sum(1 for p in cd['pairs'] if 0.3 < abs(p['corr']) <= 0.7)
+        low_corr_pairs = sum(1 for p in cd['pairs'] if abs(p['corr']) <= 0.3)
+        median_corr = float(np.median([p['corr'] for p in cd['pairs']])) if cd['pairs'] else 0
+        std_corr = float(np.std([p['corr'] for p in cd['pairs']])) if cd['pairs'] else 0
+        # Diversification quality rating
+        if cd['avg_corr'] < 0.2:
+            div_quality = "EXCELLENT"
+            div_color = "#00ff9d"
+        elif cd['avg_corr'] < 0.4:
+            div_quality = "GOOD"
+            div_color = "#00ff9d"
+        elif cd['avg_corr'] < 0.6:
+            div_quality = "MODERATE"
+            div_color = "#ffd700"
+        else:
+            div_quality = "POOR"
+            div_color = "#ff3366"
+
         if not cd['pairs']:
             tbl = ft.Text("Need 2+ assets for correlation analysis.", size=14, color="#aaaaaa")
         else:
@@ -2189,138 +3319,428 @@ def main(page: ft.Page):
                          ft.DataColumn(ft.Text("Correlation", color="#00ff9d"))],
                 rows=rows, heading_row_color="#1a1a2e",
             )
-        return _card(ft.Column([
-            ft.Text("CORRELATION DEEP-DIVE", size=22, weight=ft.FontWeight.BOLD, color="#00bfff"),
-            ft.Text("Pairwise correlations — lower = better diversification", size=12, color="#aaaaaa"),
-            ft.Row([
-                _kpi("Avg Corr", f"{cd['avg_corr']:.3f}" if cd['avg_corr'] != 0 else "N/A"),
-                _kpi("Most Correlated", f"{most[0]}/{most[1]}: {most[2]:.2f}" if most[0] != "N/A" else "N/A", "#ff3366"),
-                _kpi("Least Correlated", f"{least[0]}/{least[1]}: {least[2]:.2f}" if least[0] != "N/A" else "N/A", "#00ff9d"),
-            ], spacing=6),
-            ft.Divider(height=1, color="#333333"),
-            tbl,
-            _chart_image(data.chart_correlation_matrix()),
-        ], scroll=ft.ScrollMode.AUTO, spacing=10))
+
+        col = ft.Column(scroll=ft.ScrollMode.AUTO, spacing=10)
+        col.controls.append(ft.Text("CORRELATION DEEP-DIVE", size=22, weight=ft.FontWeight.BOLD, color="#00bfff"))
+        col.controls.append(ft.Text("Pairwise correlations — lower = better diversification", size=12, color="#aaaaaa"))
+        col.controls.append(ft.Row([
+            _kpi("Avg Corr", f"{cd['avg_corr']:.3f}" if cd['avg_corr'] != 0 else "N/A"),
+            _kpi("Median Corr", f"{median_corr:.3f}" if median_corr != 0 else "N/A", "#ffd700"),
+            _kpi("Diversification", div_quality, div_color),
+        ], spacing=6))
+        col.controls.append(ft.Row([
+            _kpi("Most Correlated", f"{most[0]}/{most[1]}: {most[2]:.2f}" if most[0] != "N/A" else "N/A", "#ff3366"),
+            _kpi("Least Correlated", f"{least[0]}/{least[1]}: {least[2]:.2f}" if least[0] != "N/A" else "N/A", "#00ff9d"),
+        ], spacing=6))
+        col.controls.append(ft.Divider(height=1, color="#333333"))
+        col.controls.append(ft.Text("CORRELATION DISTRIBUTION", size=15, weight=ft.FontWeight.BOLD, color="#9966ff"))
+        col.controls.append(ft.Row([
+            _kpi_sm("Total Pairs", str(n_pairs), "#00bfff"),
+            _kpi_sm("High (>0.7)", str(high_corr_pairs), "#ff3366"),
+            _kpi_sm("Moderate", str(moderate_pairs), "#ffd700"),
+            _kpi_sm("Low (<0.3)", str(low_corr_pairs), "#00ff9d"),
+            _kpi_sm("Negative", str(neg_corr_pairs), "#00bfff"),
+            _kpi_sm("Corr Std Dev", f"{std_corr:.3f}", "#aaaaaa"),
+        ], spacing=4))
+        col.controls.append(ft.Divider(height=1, color="#333333"))
+        col.controls.append(ft.Text("ALL PAIRWISE CORRELATIONS", size=15, weight=ft.FontWeight.BOLD, color="#ffd700"))
+        col.controls.append(tbl)
+        col.controls.append(ft.Divider(height=1, color="#333333"))
+        col.controls.append(_chart_image_expandable(data.chart_correlation_matrix()))
+        return _card(col)
 
     def health_score_tab():
         hs = data.portfolio_health_score()
         d = hs['details']
-        def _bar(label, pts, max_pts, color="#00ff9d"):
+        score = hs['score']
+        def _kpi(label, value, color="#ffd700"):
+            return ft.Container(content=ft.Column([ft.Text(label, size=10, color="#aaaaaa"), ft.Text(value, size=16, weight=ft.FontWeight.BOLD, color=color)], spacing=2), bgcolor="#1a1a2e", padding=10, border_radius=10, expand=True)
+        def _bar(label, pts, max_pts, raw_val, color="#00ff9d"):
             pct = pts / max_pts if max_pts > 0 else 0
+            pct_score = pct * 100
+            score_color = "#00ff9d" if pct >= 0.7 else "#ffd700" if pct >= 0.4 else "#ff3366"
             return ft.Row([
-                ft.Text(label, size=12, color="#aaaaaa", width=100),
+                ft.Text(label, size=12, color="#aaaaaa", width=110),
                 ft.ProgressBar(value=pct, color=color, bgcolor="#1a1a2e", expand=True),
-                ft.Text(f"{pts}/{max_pts}", size=12, color="#ffffff", width=50),
-            ], spacing=8)
-        return _card(ft.Column([
-            ft.Text("PORTFOLIO HEALTH SCORE", size=22, weight=ft.FontWeight.BOLD, color="#00ff9d"),
-            ft.Text("Composite score from 7 weighted components", size=12, color="#aaaaaa"),
-            ft.Row([
-                _chart_image(data.chart_health_gauge(hs['score'])),
-                ft.Column([
-                    ft.Text(f"Grade: {hs['grade']}", size=28, weight=ft.FontWeight.BOLD, color="#00ff9d" if hs['score'] >= 65 else "#ffd700" if hs['score'] >= 50 else "#ff3366"),
-                    ft.Text(f"Sharpe: {d['sharpe']:.2f}  |  Sortino: {d['sortino']:.2f}", size=12, color="#aaaaaa"),
-                    ft.Text(f"Vol: {d['vol']:.1%}  |  Max DD: {d['max_dd']:.1%}  |  PF: {d['profit_factor']:.2f}", size=12, color="#aaaaaa"),
-                ], spacing=4, expand=True),
-            ], spacing=10),
-            ft.Divider(height=1, color="#333333"),
-            ft.Text("SCORE BREAKDOWN", size=15, weight=ft.FontWeight.BOLD, color="#ffd700"),
-            _bar("Sharpe", d['sharpe_pts'], 20, "#00ff9d"),
-            _bar("Sortino", d['sortino_pts'], 15, "#00ff9d"),
-            _bar("Low Volatility", d['vol_pts'], 15, "#00bfff"),
-            _bar("Low Drawdown", d['dd_pts'], 15, "#ffd700"),
-            _bar("Profit Factor", d['pf_pts'], 15, "#ff9900"),
-            _bar("Diversification", d['div_pts'], 10, "#9966ff"),
-            _bar("Win Streak", d['streak_pts'], 10, "#00ff9d"),
-        ], scroll=ft.ScrollMode.AUTO, spacing=8))
+                ft.Text(f"{pts}/{max_pts}", size=11, color="#ffffff", width=45),
+                ft.Text(f"({pct_score:.0f}%)", size=10, color=score_color, width=40),
+                ft.Text(raw_val, size=10, color="#888888", width=70),
+            ], spacing=6)
+        # Grade interpretation
+        if score >= 80:
+            grade_desc = "Excellent — portfolio is well-optimized across all dimensions"
+            grade_color = "#00ff9d"
+        elif score >= 65:
+            grade_desc = "Good — solid fundamentals with room for minor improvements"
+            grade_color = "#00ff9d"
+        elif score >= 50:
+            grade_desc = "Fair — some risk factors need attention"
+            grade_color = "#ffd700"
+        elif score >= 35:
+            grade_desc = "Below Average — significant weaknesses present"
+            grade_color = "#ff9900"
+        else:
+            grade_desc = "Poor — portfolio needs substantial restructuring"
+            grade_color = "#ff3366"
+        # Find weakest components for improvement tips
+        components = [
+            ("Sharpe Ratio", d['sharpe_pts'], 20, "Improve risk-adjusted returns"),
+            ("Sortino Ratio", d['sortino_pts'], 15, "Reduce downside volatility"),
+            ("Low Volatility", d['vol_pts'], 15, "Diversify to reduce overall vol"),
+            ("Low Drawdown", d['dd_pts'], 15, "Add hedging or reduce position sizes"),
+            ("Profit Factor", d['pf_pts'], 15, "Cut losers faster, let winners run"),
+            ("Diversification", d['div_pts'], 10, "Add uncorrelated assets"),
+            ("Win Streak", d['streak_pts'], 10, "Improve trade timing/selection"),
+        ]
+        weakest = sorted(components, key=lambda x: x[1] / x[2] if x[2] > 0 else 0)[:3]
+
+        col = ft.Column(scroll=ft.ScrollMode.AUTO, spacing=8)
+        col.controls.append(ft.Text("PORTFOLIO HEALTH SCORE", size=22, weight=ft.FontWeight.BOLD, color="#00ff9d"))
+        col.controls.append(ft.Text("Composite score from 7 weighted components (100 max)", size=12, color="#aaaaaa"))
+        col.controls.append(ft.Row([
+            _chart_image(data.chart_health_gauge(score)),
+            ft.Column([
+                ft.Text(f"Grade: {hs['grade']}", size=28, weight=ft.FontWeight.BOLD, color=grade_color),
+                ft.Text(f"Score: {score}/100", size=18, color=grade_color),
+                ft.Text(grade_desc, size=11, color="#aaaaaa", italic=True),
+                ft.Divider(height=1, color="#222222"),
+                ft.Text(f"Sharpe: {d['sharpe']:.2f}  |  Sortino: {d['sortino']:.2f}", size=12, color="#aaaaaa"),
+                ft.Text(f"Vol: {d['vol']:.1%}  |  Max DD: {d['max_dd']:.1%}  |  PF: {d['profit_factor']:.2f}", size=12, color="#aaaaaa"),
+            ], spacing=4, expand=True),
+        ], spacing=10))
+        col.controls.append(ft.Divider(height=1, color="#333333"))
+        col.controls.append(ft.Text("UNDERLYING METRICS", size=14, weight=ft.FontWeight.BOLD, color="#00bfff"))
+        col.controls.append(ft.Row([
+            _kpi("Sharpe", f"{d['sharpe']:.2f}", "#00ff9d" if d['sharpe'] > 1 else "#ffd700" if d['sharpe'] > 0 else "#ff3366"),
+            _kpi("Sortino", f"{d['sortino']:.2f}", "#00ff9d" if d['sortino'] > 1 else "#ffd700" if d['sortino'] > 0 else "#ff3366"),
+            _kpi("Ann. Vol", f"{d['vol']:.1%}", "#00ff9d" if d['vol'] < 0.15 else "#ffd700" if d['vol'] < 0.25 else "#ff3366"),
+            _kpi("Max DD", f"{d['max_dd']:.1%}", "#00ff9d" if d['max_dd'] > -0.1 else "#ffd700" if d['max_dd'] > -0.2 else "#ff3366"),
+            _kpi("Profit Factor", f"{d['profit_factor']:.2f}", "#00ff9d" if d['profit_factor'] > 1.5 else "#ffd700" if d['profit_factor'] > 1 else "#ff3366"),
+        ], spacing=6))
+        col.controls.append(ft.Divider(height=1, color="#333333"))
+        col.controls.append(ft.Text("SCORE BREAKDOWN (with raw values)", size=14, weight=ft.FontWeight.BOLD, color="#ffd700"))
+        col.controls.append(_bar("Sharpe", d['sharpe_pts'], 20, f"({d['sharpe']:.2f})", "#00ff9d"))
+        col.controls.append(_bar("Sortino", d['sortino_pts'], 15, f"({d['sortino']:.2f})", "#00ff9d"))
+        col.controls.append(_bar("Low Vol", d['vol_pts'], 15, f"({d['vol']:.1%})", "#00bfff"))
+        col.controls.append(_bar("Low DD", d['dd_pts'], 15, f"({d['max_dd']:.1%})", "#ffd700"))
+        col.controls.append(_bar("Profit Factor", d['pf_pts'], 15, f"({d['profit_factor']:.2f})", "#ff9900"))
+        col.controls.append(_bar("Diversification", d['div_pts'], 10, "", "#9966ff"))
+        col.controls.append(_bar("Win Streak", d['streak_pts'], 10, "", "#00ff9d"))
+        col.controls.append(ft.Divider(height=1, color="#333333"))
+        col.controls.append(ft.Text("TOP 3 IMPROVEMENT AREAS", size=14, weight=ft.FontWeight.BOLD, color="#ff9900"))
+        for i, (name, pts, max_pts, tip) in enumerate(weakest):
+            pct = pts / max_pts * 100 if max_pts > 0 else 0
+            col.controls.append(ft.Container(
+                content=ft.Row([
+                    ft.Text(f"{i+1}.", size=14, weight=ft.FontWeight.BOLD, color="#ff9900", width=20),
+                    ft.Text(f"{name} ({pct:.0f}%)", size=12, color="#ffffff", width=140),
+                    ft.Text(tip, size=11, color="#aaaaaa"),
+                ], spacing=6),
+                bgcolor="#1a1a2e", padding=8, border_radius=8,
+            ))
+        return _card(col)
 
     def risk_returns_tab():
         ra = data.risk_adjusted_returns()
+        rs = data.returns_series
         def _kpi(label, value, color="#ffd700"):
             return ft.Container(content=ft.Column([ft.Text(label, size=10, color="#aaaaaa"), ft.Text(value, size=16, weight=ft.FontWeight.BOLD, color=color)], spacing=2), bgcolor="#1a1a2e", padding=10, border_radius=10, expand=True)
+        def _kpi_sm(label, value, color="#ffd700"):
+            return ft.Container(content=ft.Column([ft.Text(label, size=9, color="#aaaaaa"), ft.Text(value, size=13, weight=ft.FontWeight.BOLD, color=color)], spacing=1), bgcolor="#1a1a2e", padding=6, border_radius=8, expand=True)
         def _fmt(v, fmt=".2f"):
             if v == 0: return "N/A"
             return f"{v:{fmt}}"
-        return _card(ft.Column([
-            ft.Text("RISK-ADJUSTED RETURNS", size=22, weight=ft.FontWeight.BOLD, color="#ffd700"),
-            ft.Text("CAPM alpha, beta, Treynor, information ratio", size=12, color="#aaaaaa"),
-            ft.Row([
-                _kpi("Ann. Return", f"{ra['ann_return']:.1%}" if ra['ann_return'] != 0 else "N/A", "#00ff9d" if ra['ann_return'] > 0 else "#ff3366"),
-                _kpi("Ann. Volatility", f"{ra['ann_vol']:.1%}" if ra['ann_vol'] != 0 else "N/A", "#ff3366"),
-                _kpi("Sharpe", _fmt(ra['sharpe']), "#00ff9d" if ra['sharpe'] > 0 else "#ff3366"),
-                _kpi("Sortino", _fmt(ra['sortino']), "#00ff9d" if ra['sortino'] > 0 else "#ff3366"),
-            ], spacing=6),
-            ft.Row([
-                _kpi("Calmar", _fmt(ra['calmar']), "#00ff9d" if ra['calmar'] > 0 else "#ff3366"),
-                _kpi("Max DD", f"{ra['max_dd']:.1%}" if ra['max_dd'] != 0 else "N/A", "#ff3366"),
-                _kpi("Profit Factor", _fmt(ra['profit_factor']), "#00ff9d" if ra['profit_factor'] > 1 else "#ff3366"),
-                _kpi("VaR 95%", f"{ra['var_95']:.2%}" if ra['var_95'] != 0 else "N/A", "#ff3366"),
-            ], spacing=6),
-            ft.Divider(height=1, color="#333333"),
-            ft.Text("CAPM METRICS", size=15, weight=ft.FontWeight.BOLD, color="#ffd700"),
-            ft.Row([
-                _kpi("Beta (vs SPY)", _fmt(ra['beta']), "#ffd700"),
-                _kpi("Alpha (CAPM)", f"{ra['alpha']:.2%}" if ra['alpha'] != 0 else "N/A", "#00ff9d" if ra['alpha'] > 0 else "#ff3366"),
-                _kpi("Treynor", _fmt(ra['treynor']), "#00ff9d" if ra['treynor'] > 0 else "#ff3366"),
-                _kpi("Info Ratio", _fmt(ra['info_ratio']), "#00ff9d" if ra['info_ratio'] > 0 else "#ff3366"),
-            ], spacing=6),
-            ft.Text("Beta = market sensitivity. Alpha = excess return vs CAPM. Treynor = return per unit systematic risk.", size=11, color="#666666", italic=True),
-        ], scroll=ft.ScrollMode.AUTO, spacing=8))
+        # Extra computed risk metrics
+        tail_ratio_val = 0
+        downside_dev = 0
+        avg_win = 0
+        avg_loss = 0
+        payoff = 0
+        if not rs.empty and len(rs) > 10:
+            p95 = float(np.percentile(rs, 95))
+            p5 = float(np.percentile(rs, 5))
+            tail_ratio_val = abs(p95 / p5) if p5 != 0 else 0
+            downside_dev = float(rs[rs < 0].std() * np.sqrt(252)) if (rs < 0).any() else 0
+            avg_win = float(rs[rs > 0].mean()) if (rs > 0).any() else 0
+            avg_loss = float(rs[rs < 0].mean()) if (rs < 0).any() else 0
+            payoff = abs(avg_win / avg_loss) if avg_loss != 0 else 0
+
+        col = ft.Column(scroll=ft.ScrollMode.AUTO, spacing=8)
+        col.controls.append(ft.Text("RISK-ADJUSTED RETURNS", size=22, weight=ft.FontWeight.BOLD, color="#ffd700"))
+        col.controls.append(ft.Text("Complete risk-return profile including CAPM, tail risk, and trading edge metrics", size=12, color="#aaaaaa"))
+        col.controls.append(ft.Text("RETURN & VOLATILITY", size=14, weight=ft.FontWeight.BOLD, color="#00ff9d"))
+        col.controls.append(ft.Row([
+            _kpi("Ann. Return", f"{ra['ann_return']:.1%}" if ra['ann_return'] != 0 else "N/A", "#00ff9d" if ra['ann_return'] > 0 else "#ff3366"),
+            _kpi("Ann. Volatility", f"{ra['ann_vol']:.1%}" if ra['ann_vol'] != 0 else "N/A", "#ff3366"),
+            _kpi("Downside Dev", f"{downside_dev:.1%}" if downside_dev else "N/A", "#ff9900"),
+            _kpi("Max DD", f"{ra['max_dd']:.1%}" if ra['max_dd'] != 0 else "N/A", "#ff3366"),
+        ], spacing=6))
+        col.controls.append(ft.Divider(height=1, color="#222222"))
+        col.controls.append(ft.Text("RISK-ADJUSTED RATIOS", size=14, weight=ft.FontWeight.BOLD, color="#00bfff"))
+        col.controls.append(ft.Row([
+            _kpi("Sharpe", _fmt(ra['sharpe']), "#00ff9d" if ra['sharpe'] > 0 else "#ff3366"),
+            _kpi("Sortino", _fmt(ra['sortino']), "#00ff9d" if ra['sortino'] > 0 else "#ff3366"),
+            _kpi("Calmar", _fmt(ra['calmar']), "#00ff9d" if ra['calmar'] > 0 else "#ff3366"),
+            _kpi("Profit Factor", _fmt(ra['profit_factor']), "#00ff9d" if ra['profit_factor'] > 1 else "#ff3366"),
+        ], spacing=6))
+        col.controls.append(ft.Divider(height=1, color="#222222"))
+        col.controls.append(ft.Text("TAIL RISK", size=14, weight=ft.FontWeight.BOLD, color="#ff3366"))
+        col.controls.append(ft.Row([
+            _kpi("VaR 95%", f"{ra['var_95']:.2%}" if ra['var_95'] != 0 else "N/A", "#ff3366"),
+            _kpi("Tail Ratio", f"{tail_ratio_val:.2f}" if tail_ratio_val else "N/A", "#00ff9d" if tail_ratio_val > 1 else "#ff3366"),
+            _kpi("Avg Win", f"{avg_win:.2%}" if avg_win else "N/A", "#00ff9d"),
+            _kpi("Avg Loss", f"{avg_loss:.2%}" if avg_loss else "N/A", "#ff3366"),
+        ], spacing=6))
+        col.controls.append(ft.Row([
+            _kpi_sm("Payoff Ratio", f"{payoff:.2f}" if payoff else "N/A", "#00ff9d" if payoff > 1 else "#ff3366"),
+        ], spacing=6))
+        col.controls.append(ft.Divider(height=1, color="#222222"))
+        col.controls.append(ft.Text("CAPM METRICS", size=14, weight=ft.FontWeight.BOLD, color="#ffd700"))
+        col.controls.append(ft.Row([
+            _kpi("Beta (vs SPY)", _fmt(ra['beta']), "#ffd700"),
+            _kpi("Alpha (CAPM)", f"{ra['alpha']:.2%}" if ra['alpha'] != 0 else "N/A", "#00ff9d" if ra['alpha'] > 0 else "#ff3366"),
+            _kpi("Treynor", _fmt(ra['treynor']), "#00ff9d" if ra['treynor'] > 0 else "#ff3366"),
+            _kpi("Info Ratio", _fmt(ra['info_ratio']), "#00ff9d" if ra['info_ratio'] > 0 else "#ff3366"),
+        ], spacing=6))
+        col.controls.append(ft.Text("Beta = market sensitivity. Alpha = excess return vs CAPM. Treynor = return per unit systematic risk. Tail Ratio > 1 = fatter right tail (good).", size=10, color="#666666", italic=True))
+        return _card(col)
 
     def streaks_tab():
         wl = data.win_loss_streaks()
         rec = data.recovery_time()
         s = data.portfolio_summary_stats()
+        pf_val = data.profit_factor()
+        ra = data.risk_adjusted_returns()
+        rs = data.returns_series
         def _kpi(label, value, color="#ffd700"):
             return ft.Container(content=ft.Column([ft.Text(label, size=10, color="#aaaaaa"), ft.Text(str(value), size=18, weight=ft.FontWeight.BOLD, color=color)], spacing=2), bgcolor="#1a1a2e", padding=12, border_radius=10, expand=True)
+        def _kpi_sm(label, value, color="#ffd700"):
+            return ft.Container(content=ft.Column([ft.Text(label, size=9, color="#aaaaaa"), ft.Text(str(value), size=14, weight=ft.FontWeight.BOLD, color=color)], spacing=1), bgcolor="#1a1a2e", padding=8, border_radius=8, expand=True)
         pos = s.get("positive_days", 0)
         neg = s.get("negative_days", 0)
         skew = s.get("skewness", 0)
         kurt = s.get("kurtosis", 0)
-        return _card(ft.Column([
-            ft.Text("WIN/LOSS STREAKS & STATS", size=22, weight=ft.FontWeight.BOLD, color="#00ff9d"),
-            ft.Text("Trading day performance and streak analysis", size=12, color="#aaaaaa"),
-            ft.Row([
-                _kpi("Longest Win", f"{wl['longest_win']}d" if wl['longest_win'] > 0 else "N/A", "#00ff9d"),
-                _kpi("Longest Loss", f"{wl['longest_loss']}d" if wl['longest_loss'] > 0 else "N/A", "#ff3366"),
-                _kpi("Current", f"{wl['current_streak']}d ({wl['current_type']})" if wl['current_type'] != "N/A" else "N/A", "#00ff9d" if wl['current_type'] == "win" else "#ff3366"),
-            ], spacing=6),
-            ft.Row([
-                _kpi("Positive Days", str(pos) if pos > 0 else "N/A", "#00ff9d"),
-                _kpi("Negative Days", str(neg) if neg > 0 else "N/A", "#ff3366"),
-                _kpi("Win Rate", f"{pos/(pos+neg):.0%}" if (pos + neg) > 0 else "N/A", "#00ff9d" if pos > neg else "#ff3366"),
-            ], spacing=6),
-            ft.Divider(height=1, color="#333333"),
-            ft.Text("DRAWDOWN RECOVERY", size=15, weight=ft.FontWeight.BOLD, color="#ffd700"),
-            ft.Row([
-                _kpi("Max Recovery", f"{rec['max_recovery_days']}d" if rec['max_recovery_days'] > 0 else "N/A"),
-                _kpi("In Drawdown?", "YES" if rec['currently_in_drawdown'] else "NO", "#ff3366" if rec['currently_in_drawdown'] else "#00ff9d"),
-                _kpi("Current DD", f"{rec['current_dd_days']}d" if rec['current_dd_days'] > 0 else "N/A", "#ff3366"),
-            ], spacing=6),
-            ft.Divider(height=1, color="#333333"),
-            ft.Text("DISTRIBUTION", size=15, weight=ft.FontWeight.BOLD, color="#ffd700"),
-            ft.Row([
-                _kpi("Skewness", f"{skew:.3f}" if skew != 0 else "N/A", "#00ff9d" if skew > 0 else "#ff3366"),
-                _kpi("Kurtosis", f"{kurt:.3f}" if kurt != 0 else "N/A", "#ffd700"),
-            ], spacing=6),
-            ft.Text("Negative skew = more left-tail risk. High kurtosis = fat tails.", size=11, color="#666666", italic=True),
-        ], scroll=ft.ScrollMode.AUTO, spacing=8))
+        vol = s.get("ann_volatility", 0)
+        max_dd = s.get("max_drawdown", 0)
+        var95 = s.get("var_95", 0)
+        cvar95 = s.get("cvar_95", 0)
+        # Compute extra stats from returns series
+        avg_win = float(rs[rs > 0].mean()) if not rs.empty and (rs > 0).any() else 0
+        avg_loss = float(rs[rs < 0].mean()) if not rs.empty and (rs < 0).any() else 0
+        max_gain = float(rs.max()) if not rs.empty else 0
+        max_loss = float(rs.min()) if not rs.empty else 0
+        avg_daily = float(rs.mean()) if not rs.empty else 0
+        std_daily = float(rs.std()) if not rs.empty else 0
+        total_days = len(rs)
+        payoff = abs(avg_win / avg_loss) if avg_loss != 0 else 0
+        expectancy = (pos / max(pos + neg, 1)) * avg_win + (neg / max(pos + neg, 1)) * avg_loss if (pos + neg) > 0 else 0
+        # Risk of ruin approximation
+        wr = pos / max(pos + neg, 1) if (pos + neg) > 0 else 0
+        risk_of_ruin = ((1 - wr) / wr) ** 10 if wr > 0 and wr < 1 else (1.0 if wr == 0 else 0.0)
+
+        col = ft.Column(scroll=ft.ScrollMode.AUTO, spacing=8)
+        col.controls.append(ft.Text("WIN/LOSS STREAKS & STATS", size=22, weight=ft.FontWeight.BOLD, color="#00ff9d"))
+        col.controls.append(ft.Text("Complete trading day performance, streak analysis, and risk metrics", size=12, color="#aaaaaa"))
+
+        col.controls.append(ft.Text("STREAK ANALYSIS", size=15, weight=ft.FontWeight.BOLD, color="#00ff9d"))
+        col.controls.append(ft.Row([
+            _kpi("Longest Win", f"{wl['longest_win']}d" if wl['longest_win'] > 0 else "N/A", "#00ff9d"),
+            _kpi("Longest Loss", f"{wl['longest_loss']}d" if wl['longest_loss'] > 0 else "N/A", "#ff3366"),
+            _kpi("Current", f"{wl['current_streak']}d ({wl['current_type']})" if wl['current_type'] != "N/A" else "N/A", "#00ff9d" if wl['current_type'] == "win" else "#ff3366"),
+        ], spacing=6))
+        col.controls.append(ft.Row([
+            _kpi("Positive Days", str(pos) if pos > 0 else "N/A", "#00ff9d"),
+            _kpi("Negative Days", str(neg) if neg > 0 else "N/A", "#ff3366"),
+            _kpi("Win Rate", f"{pos/(pos+neg):.1%}" if (pos + neg) > 0 else "N/A", "#00ff9d" if pos > neg else "#ff3366"),
+        ], spacing=6))
+        col.controls.append(ft.Divider(height=1, color="#333333"))
+
+        col.controls.append(ft.Text("TRADE STATISTICS", size=15, weight=ft.FontWeight.BOLD, color="#ffd700"))
+        col.controls.append(ft.Row([
+            _kpi("Avg Win", f"{avg_win:.2%}" if avg_win else "N/A", "#00ff9d"),
+            _kpi("Avg Loss", f"{avg_loss:.2%}" if avg_loss else "N/A", "#ff3366"),
+            _kpi("Payoff Ratio", f"{payoff:.2f}" if payoff else "N/A", "#00ff9d" if payoff > 1 else "#ff3366"),
+        ], spacing=6))
+        col.controls.append(ft.Row([
+            _kpi("Best Day", f"{max_gain:.2%}" if max_gain else "N/A", "#00ff9d"),
+            _kpi("Worst Day", f"{max_loss:.2%}" if max_loss else "N/A", "#ff3366"),
+            _kpi("Profit Factor", f"{pf_val:.2f}" if pf_val else "N/A", "#00ff9d" if pf_val > 1 else "#ff3366"),
+        ], spacing=6))
+        col.controls.append(ft.Divider(height=1, color="#333333"))
+
+        col.controls.append(ft.Text("EXPECTANCY & RISK", size=15, weight=ft.FontWeight.BOLD, color="#ff9900"))
+        col.controls.append(ft.Row([
+            _kpi("Expectancy", f"{expectancy:.4f}" if expectancy else "N/A", "#00ff9d" if expectancy > 0 else "#ff3366"),
+            _kpi("Risk of Ruin", f"{risk_of_ruin:.2%}", "#ff3366" if risk_of_ruin > 0.1 else "#00ff9d"),
+            _kpi("Avg Daily", f"{avg_daily:.4f}" if avg_daily else "N/A", "#00ff9d" if avg_daily > 0 else "#ff3366"),
+        ], spacing=6))
+        col.controls.append(ft.Row([
+            _kpi("Daily Std Dev", f"{std_daily:.4f}" if std_daily else "N/A", "#ffd700"),
+            _kpi("VaR 95%", f"{var95:.2%}" if var95 else "N/A", "#ff3366"),
+            _kpi("CVaR 95%", f"{cvar95:.2%}" if cvar95 else "N/A", "#ff3366"),
+        ], spacing=6))
+        col.controls.append(ft.Row([
+            _kpi_sm("Total Trading Days", str(total_days) if total_days else "N/A", "#00bfff"),
+            _kpi_sm("Ann. Volatility", f"{vol:.1%}" if vol else "N/A", "#ff3366"),
+            _kpi_sm("Max Drawdown", f"{max_dd:.1%}" if max_dd else "N/A", "#ff3366"),
+            _kpi_sm("Beta (SPY)", f"{ra.get('beta', 0):.2f}" if ra.get('beta') else "N/A", "#ffd700"),
+        ], spacing=4))
+        col.controls.append(ft.Divider(height=1, color="#333333"))
+
+        col.controls.append(ft.Text("DRAWDOWN RECOVERY", size=15, weight=ft.FontWeight.BOLD, color="#ff3366"))
+        col.controls.append(ft.Row([
+            _kpi("Max Recovery", f"{rec['max_recovery_days']}d" if rec['max_recovery_days'] > 0 else "N/A"),
+            _kpi("Avg Recovery", f"{rec.get('avg_recovery_days', 0):.0f}d" if rec.get('avg_recovery_days', 0) > 0 else "N/A", "#ffd700"),
+            _kpi("In Drawdown?", "YES" if rec['currently_in_drawdown'] else "NO", "#ff3366" if rec['currently_in_drawdown'] else "#00ff9d"),
+            _kpi("Current DD Days", f"{rec['current_dd_days']}d" if rec['current_dd_days'] > 0 else "N/A", "#ff3366"),
+        ], spacing=6))
+        col.controls.append(ft.Divider(height=1, color="#333333"))
+
+        col.controls.append(ft.Text("DISTRIBUTION", size=15, weight=ft.FontWeight.BOLD, color="#9966ff"))
+        col.controls.append(ft.Row([
+            _kpi("Skewness", f"{skew:.3f}" if skew != 0 else "N/A", "#00ff9d" if skew > 0 else "#ff3366"),
+            _kpi("Kurtosis", f"{kurt:.3f}" if kurt != 0 else "N/A", "#ffd700"),
+        ], spacing=6))
+        col.controls.append(ft.Text("Negative skew = more left-tail risk. High kurtosis = fat tails. Payoff > 1 = wins bigger than losses. Expectancy > 0 = positive edge.", size=10, color="#666666", italic=True))
+        return _card(col)
 
     # ====================== PROFIT CHARTS TAB ======================
     def profit_charts_tab():
-        return _card(ft.Column([
-            ft.Text("PROFIT CHARTS", size=20, weight=ft.FontWeight.BOLD, color="#00ff9d"),
-            ft.Text("Daily, weekly, and rolling weekly profit/loss", size=12, color="#888888"),
-            ft.Divider(height=1, color="#333333"),
-            ft.Text("DAILY PROFIT / LOSS", size=15, weight=ft.FontWeight.BOLD, color="#00ff9d"),
-            _chart_image(data.chart_daily_profit()),
-            ft.Divider(height=1, color="#333333"),
-            ft.Text("WEEKLY PROFIT / LOSS", size=15, weight=ft.FontWeight.BOLD, color="#ffd700"),
-            _chart_image(data.chart_weekly_profit()),
-            ft.Divider(height=1, color="#333333"),
-            ft.Text("ROLLING 5-DAY (WEEKLY) PROFIT", size=15, weight=ft.FontWeight.BOLD, color="#00bfff"),
-            _chart_image(data.chart_rolling_weekly_profit()),
-        ], scroll=ft.ScrollMode.AUTO, spacing=8))
+        pnl_state = {'mode': '$', 'start': 0, 'end': len(data.returns_series) if not data.returns_series.empty else 0}
+        max_points = pnl_state['end']
+        rs = data.returns_series
+
+        def _kpi(label, value, color="#ffd700"):
+            return ft.Container(content=ft.Column([ft.Text(label, size=9, color="#aaaaaa"), ft.Text(value, size=14, weight=ft.FontWeight.BOLD, color=color)], spacing=1), bgcolor="#1a1a2e", padding=8, border_radius=8, expand=True)
+
+        # Compute P&L summary stats
+        pnl_kpis = []
+        if not rs.empty and len(rs) > 1:
+            total_val = data.portfolio_summary_stats().get('total_value', 0)
+            cost_basis = data.portfolio_summary_stats().get('total_cost', 0)
+            total_pnl = total_val - cost_basis if cost_basis else 0
+            avg_daily = float(rs.mean())
+            std_daily = float(rs.std())
+            best_day = float(rs.max())
+            worst_day = float(rs.min())
+            pos_days = int((rs > 0).sum())
+            neg_days = int((rs < 0).sum())
+            total_days = len(rs)
+            win_pct = pos_days / total_days * 100 if total_days else 0
+            # Weekly returns
+            try:
+                weekly_rs = rs.resample('W').apply(lambda x: (1 + x).prod() - 1)
+                avg_weekly = float(weekly_rs.mean()) if len(weekly_rs) > 0 else 0
+                best_week = float(weekly_rs.max()) if len(weekly_rs) > 0 else 0
+                worst_week = float(weekly_rs.min()) if len(weekly_rs) > 0 else 0
+                n_weeks = len(weekly_rs)
+            except Exception:
+                avg_weekly = best_week = worst_week = 0
+                n_weeks = 0
+
+            pnl_kpis = [
+                ft.Text("P&L SUMMARY", size=14, weight=ft.FontWeight.BOLD, color="#00bfff"),
+                ft.Row([
+                    _kpi("Total P&L", f"${total_pnl:,.0f}" if total_pnl else "N/A", "#00ff9d" if total_pnl >= 0 else "#ff3366"),
+                    _kpi("Avg Daily", f"{avg_daily:.3%}", "#00ff9d" if avg_daily >= 0 else "#ff3366"),
+                    _kpi("Daily Std Dev", f"{std_daily:.3%}", "#ff9900"),
+                    _kpi("Best Day", f"{best_day:.2%}", "#00ff9d"),
+                    _kpi("Worst Day", f"{worst_day:.2%}", "#ff3366"),
+                ], spacing=4),
+                ft.Row([
+                    _kpi("Win Days", str(pos_days), "#00ff9d"),
+                    _kpi("Loss Days", str(neg_days), "#ff3366"),
+                    _kpi("Win %", f"{win_pct:.1f}%", "#00ff9d" if win_pct >= 50 else "#ff3366"),
+                    _kpi("Avg Weekly", f"{avg_weekly:.2%}" if n_weeks else "N/A", "#00ff9d" if avg_weekly >= 0 else "#ff3366"),
+                    _kpi("Best Week", f"{best_week:.2%}" if n_weeks else "N/A", "#00ff9d"),
+                    _kpi("Worst Week", f"{worst_week:.2%}" if n_weeks else "N/A", "#ff3366"),
+                ], spacing=4),
+                ft.Divider(height=1, color="#333333"),
+            ]
+
+        pnl_state['cumulative'] = False
+        pnl_state['style'] = 'bar'
+        pnl_state['avg'] = False
+
+        daily_chart_container = ft.Container(
+            content=_chart_image(data.chart_daily_profit(mode='$')),
+            padding=0,
+        )
+
+        def _rebuild_pnl():
+            daily_chart_container.content = _chart_image(
+                data.chart_daily_profit(mode=pnl_state['mode'], start_idx=pnl_state['start'],
+                                         end_idx=pnl_state['end'], cumulative=pnl_state['cumulative'],
+                                         chart_style=pnl_state['style'], show_avg=pnl_state['avg'])
+            )
+            page.update()
+
+        def on_mode_change(e):
+            pnl_state['mode'] = e.control.value
+            _rebuild_pnl()
+
+        def on_range_change(e):
+            pnl_state['start'] = int(e.control.start_value)
+            pnl_state['end'] = int(e.control.end_value)
+            _rebuild_pnl()
+
+        def _pnl_tog(key):
+            def handler(e):
+                pnl_state[key] = e.control.value
+                _rebuild_pnl()
+            return handler
+
+        def _pnl_style(e):
+            pnl_state['style'] = e.control.value
+            _rebuild_pnl()
+
+        mode_dropdown = ft.Dropdown(
+            value="$", width=100,
+            options=[ft.dropdown.Option("$", "Dollar ($)"), ft.dropdown.Option("%", "Percent (%)")],
+            on_select=on_mode_change,
+            border_color="#00ff9d", color="#ffffff", bgcolor="#1a1a2e",
+        )
+
+        range_slider = ft.RangeSlider(
+            min=0, max=max(max_points, 1), start_value=0, end_value=max(max_points, 1),
+            divisions=max(max_points, 1),
+            active_color="#00ff9d", inactive_color="#333333",
+            on_change=on_range_change,
+        ) if max_points > 0 else ft.Text("No data for range slider", size=12, color="#888888")
+
+        pnl_toggles = ft.Row([
+            ft.Text("Style:", size=11, color="#aaaaaa"),
+            ft.Dropdown(value="bar", width=90, options=[
+                ft.dropdown.Option("bar", "Bar"), ft.dropdown.Option("line", "Line"),
+                ft.dropdown.Option("area", "Area"),
+            ], on_select=_pnl_style, border_color="#00ff9d", color="#ffffff", bgcolor="#1a1a2e"),
+            ft.Switch(label="Cumulative", value=False, active_color="#00bfff",
+                      label_text_style=ft.TextStyle(size=11, color="#aaaaaa"), on_change=_pnl_tog('cumulative')),
+            ft.Switch(label="Show Average", value=False, active_color="#ffd700",
+                      label_text_style=ft.TextStyle(size=11, color="#aaaaaa"), on_change=_pnl_tog('avg')),
+        ], spacing=8, scroll=ft.ScrollMode.AUTO)
+
+        col = ft.Column(scroll=ft.ScrollMode.AUTO, spacing=8)
+        col.controls.append(ft.Text("PROFIT / LOSS CHARTS", size=20, weight=ft.FontWeight.BOLD, color="#00ff9d"))
+        col.controls.append(ft.Text("Daily, weekly, and rolling weekly profit/loss with summary statistics", size=12, color="#888888"))
+        for kpi in pnl_kpis:
+            col.controls.append(kpi)
+        col.controls.append(ft.Text("DAILY PROFIT / LOSS", size=15, weight=ft.FontWeight.BOLD, color="#00ff9d"))
+        col.controls.append(ft.Row([
+            ft.Text("Display:", size=12, color="#aaaaaa"),
+            mode_dropdown,
+            ft.Text("Date Range:", size=12, color="#aaaaaa"),
+        ], spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER))
+        col.controls.append(pnl_toggles)
+        col.controls.append(range_slider)
+        col.controls.append(daily_chart_container)
+        col.controls.append(ft.Divider(height=1, color="#333333"))
+        col.controls.append(ft.Text("WEEKLY PROFIT / LOSS", size=15, weight=ft.FontWeight.BOLD, color="#ffd700"))
+        col.controls.append(_chart_image(data.chart_weekly_profit()))
+        col.controls.append(ft.Divider(height=1, color="#333333"))
+        col.controls.append(ft.Text("ROLLING 5-DAY (WEEKLY) PROFIT", size=15, weight=ft.FontWeight.BOLD, color="#00bfff"))
+        col.controls.append(_chart_image(data.chart_rolling_weekly_profit()))
+        return _card(col)
 
     # ====================== PROGRESSION TAB (Investment Growth Analysis) ======================
     def progression_tab():
@@ -2351,6 +3771,8 @@ def main(page: ft.Page):
         season = data.monthly_seasonality()
         bw = data.best_worst_periods()
         rec = data.recovery_time()
+        ra = data.risk_adjusted_returns()
+        rs = data.returns_series
 
         total_val = s.get('total_value', 0)
         total_gl = s.get('total_gain_loss', 0)
@@ -2359,10 +3781,29 @@ def main(page: ft.Page):
         ann_vol = s.get('ann_volatility', 0)
         sharpe = s.get('sharpe', 0)
         sortino = s.get('sortino', 0)
+        calmar = s.get('calmar', 0)
         max_dd = s.get('max_drawdown', 0)
         win_rate = s.get('win_rate', 0)
         n_hold = s.get('num_holdings', 0)
         total_pct = s.get('total_gain_pct', 0)
+        var95 = s.get('var_95', 0)
+        cvar95 = s.get('cvar_95', 0)
+        beta = ra.get('beta', 0)
+        alpha = ra.get('alpha', 0)
+        treynor = ra.get('treynor', 0)
+        info_ratio = ra.get('info_ratio', 0)
+        # Extra computed metrics
+        avg_win = float(rs[rs > 0].mean()) if not rs.empty and (rs > 0).any() else 0
+        avg_loss = float(rs[rs < 0].mean()) if not rs.empty and (rs < 0).any() else 0
+        payoff = abs(avg_win / avg_loss) if avg_loss != 0 else 0
+        expectancy = (s.get('positive_days', 0) / max(s.get('positive_days', 0) + s.get('negative_days', 0), 1)) * avg_win + (s.get('negative_days', 0) / max(s.get('positive_days', 0) + s.get('negative_days', 0), 1)) * avg_loss if (s.get('positive_days', 0) + s.get('negative_days', 0)) > 0 else 0
+        tail_ratio_val = 0
+        downside_dev = 0
+        if not rs.empty and len(rs) > 10:
+            p95 = float(np.percentile(rs, 95))
+            p5 = float(np.percentile(rs, 5))
+            tail_ratio_val = abs(p95 / p5) if p5 != 0 else 0
+            downside_dev = float(rs[rs < 0].std() * np.sqrt(252)) if (rs < 0).any() else 0
 
         # =================== 1. JOURNEY OVERVIEW ===================
         result_col.controls.append(_section_title("YOUR INVESTMENT JOURNEY", "#00ff9d"))
@@ -2390,6 +3831,31 @@ def main(page: ft.Page):
             _k("Ann. Return", f"{ann_ret:.1%}", "#00ff9d" if ann_ret > 0 else "#ff3366"),
             _k("Volatility", f"{ann_vol:.1%}", "#ff9900"),
             _k("Sharpe Ratio", f"{sharpe:.2f}", "#00ff9d" if sharpe > 1 else "#ffd700" if sharpe > 0 else "#ff3366"),
+        ], spacing=4))
+        result_col.controls.append(ft.Divider(height=1, color="#333333"))
+
+        # =================== 1b. COMPREHENSIVE RISK METRICS ===================
+        result_col.controls.append(_section_title("COMPREHENSIVE RISK METRICS", "#ff3366"))
+        result_col.controls.append(ft.Row([
+            _k("Sortino", f"{sortino:.2f}", "#00ff9d" if sortino > 0 else "#ff3366"),
+            _k("Calmar", f"{calmar:.2f}", "#00ff9d" if calmar > 0 else "#ff3366"),
+            _k("Max DD", f"{max_dd:.1%}", "#ff3366"),
+            _k("VaR 95%", f"{var95:.2%}" if var95 else "N/A", "#ff3366"),
+            _k("CVaR 95%", f"{cvar95:.2%}" if cvar95 else "N/A", "#ff3366"),
+        ], spacing=4))
+        result_col.controls.append(ft.Row([
+            _k("Beta (SPY)", f"{beta:.2f}" if beta else "N/A", "#ffd700"),
+            _k("Alpha (CAPM)", f"{alpha:.2%}" if alpha else "N/A", "#00ff9d" if alpha > 0 else "#ff3366"),
+            _k("Treynor", f"{treynor:.2f}" if treynor else "N/A", "#00ff9d" if treynor > 0 else "#ff3366"),
+            _k("Info Ratio", f"{info_ratio:.2f}" if info_ratio else "N/A", "#00ff9d" if info_ratio > 0 else "#ff3366"),
+            _k("Tail Ratio", f"{tail_ratio_val:.2f}" if tail_ratio_val else "N/A", "#00ff9d" if tail_ratio_val > 1 else "#ff3366"),
+        ], spacing=4))
+        result_col.controls.append(ft.Row([
+            _k("Profit Factor", f"{pf_val:.2f}" if pf_val else "N/A", "#00ff9d" if isinstance(pf_val, (int, float)) and pf_val > 1 else "#ff3366"),
+            _k("Win Rate", f"{win_rate:.0%}", "#00ff9d" if win_rate > 0.5 else "#ff3366"),
+            _k("Payoff Ratio", f"{payoff:.2f}" if payoff else "N/A", "#00ff9d" if payoff > 1 else "#ff3366"),
+            _k("Expectancy", f"{expectancy:.4f}" if expectancy else "N/A", "#00ff9d" if expectancy > 0 else "#ff3366"),
+            _k("Downside Dev", f"{downside_dev:.1%}" if downside_dev else "N/A", "#ff9900"),
         ], spacing=4))
         result_col.controls.append(ft.Divider(height=1, color="#333333"))
 
@@ -2606,34 +4072,9 @@ def main(page: ft.Page):
         result_col.controls.append(_chart_image(bm_chart))
         result_col.controls.append(ft.Divider(height=1, color="#333333"))
 
-        # =================== 15. GROWTH TRAJECTORY & PROJECTION ===================
-        result_col.controls.append(_section_title("GROWTH TRAJECTORY & PROJECTION", "#00ff9d"))
-        if ann_ret > 0 and total_val > 0:
-            proj_years = [1, 2, 3, 5, 10, 15, 20, 25, 30]
-            result_col.controls.append(ft.Row([
-                ft.Text("Year", size=11, color="#aaaaaa", width=50),
-                ft.Text("Optimistic", size=11, color="#aaaaaa", width=110),
-                ft.Text("Base Case", size=11, color="#aaaaaa", width=110),
-                ft.Text("Conservative", size=11, color="#aaaaaa", width=110),
-                ft.Text("Pessimistic", size=11, color="#aaaaaa", width=110),
-            ], spacing=4))
-            for y in proj_years:
-                opt = total_val * (1 + ann_ret * 1.3) ** y
-                base = total_val * (1 + ann_ret) ** y
-                cons = total_val * (1 + ann_ret * 0.6) ** y
-                pess = total_val * (1 + max(ann_ret * 0.2, -0.03)) ** y
-                result_col.controls.append(ft.Row([
-                    ft.Text(f"+{y}", size=12, color="#ffffff", width=50),
-                    ft.Text(f"${opt:,.0f}", size=12, color="#00ff9d", width=110),
-                    ft.Text(f"${base:,.0f}", size=12, color="#ffd700", width=110),
-                    ft.Text(f"${cons:,.0f}", size=12, color="#ff9900", width=110),
-                    ft.Text(f"${pess:,.0f}", size=12, color="#ff3366", width=110),
-                ], spacing=4))
-        else:
-            result_col.controls.append(ft.Text("Import data to see growth projections.", size=13, color="#888888"))
-        result_col.controls.append(ft.Divider(height=1, color="#333333"))
+        # (Projection section removed)
 
-        # =================== 16. PORTFOLIO EVOLUTION TIMELINE ===================
+        # =================== 15. PORTFOLIO EVOLUTION TIMELINE ===================
         result_col.controls.append(_section_title("PORTFOLIO EVOLUTION", "#9966ff"))
         if not data.master_df.empty and 'date' in data.master_df.columns and 'symbol' in data.master_df.columns:
             df = data.master_df.sort_values('date')
@@ -2807,20 +4248,35 @@ def main(page: ft.Page):
     # ====================== LAYOUT ======================
     load_category(0)
 
+    # Stop server when browser tab is closed
+    def on_disconnect(e):
+        try:
+            data.close()
+        except Exception:
+            pass
+        os._exit(0)
+    page.on_disconnect = on_disconnect
+
     page.add(
         snack,
         header,
-        ft.Row(
+        ft.Stack(
             [
-                nav_rail,
-                ft.VerticalDivider(width=1, color="#333333"),
-                ft.Container(
-                    content=content_area,
+                ft.Row(
+                    [
+                        nav_rail,
+                        ft.VerticalDivider(width=1, color="#333333"),
+                        ft.Container(
+                            content=content_area,
+                            expand=True,
+                            padding=15,
+                            bgcolor="#0f0f0f",
+                            clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+                        ),
+                    ],
                     expand=True,
-                    padding=15,
-                    bgcolor="#0f0f0f",
-                    clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
                 ),
+                main_loading_overlay,
             ],
             expand=True,
         ),
