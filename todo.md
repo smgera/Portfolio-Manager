@@ -4,7 +4,7 @@ use # Base directories
 use activity and positions files at  ACCOUNT_ACTIVITY_DIR: Final[Path] = PARENT_DATA_DIR / "accountActivity"
 use Fidelity_Positions_DATE.csv files, they are positions snapshots, see read_portfolio_positions.py
 see accountActivity.py
-use portfolio_performance.py to make ..\data\tickerLists\myTickers.tsv
+use portfolio_performance.py to make ../data\tickerLists\myTickers.tsv
 I have no shorts, everything I sell, I bought previously
 portfolio holdings should not include closed positions
 use myTickers.tsv for current open positions
